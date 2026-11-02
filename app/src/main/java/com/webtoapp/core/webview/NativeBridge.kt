@@ -852,6 +852,7 @@ await WtaDirectory.write('exports/image.png', pngBytes);
     @JavascriptInterface
     fun requestNotificationPermission(): String {
         if (!capabilities.notification) return "denied"
+        BridgeAlarmReceiver.ensureChannels(context)
         val current = getNotificationPermissionState()
         if (current == "granted" || current == "denied") return current
 
@@ -1052,6 +1053,7 @@ await WtaDirectory.write('exports/image.png', pngBytes);
     fun openNotificationSettings(): Boolean {
         if (!capabilities.notification) return false
         return try {
+            BridgeAlarmReceiver.ensureChannels(context)
             val intent = Intent().apply {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     action = Settings.ACTION_APP_NOTIFICATION_SETTINGS
@@ -1092,6 +1094,7 @@ await WtaDirectory.write('exports/image.png', pngBytes);
                 else -> System.currentTimeMillis() + 1000L
             }
 
+            BridgeAlarmReceiver.ensureChannels(context)
             scheduleBridgeAlarm(triggerAtMillis, title, body, tag, channelId, deepLink, playSound)
         } catch (e: Exception) {
             AppLogger.e("NativeBridge", "Failed to schedule notification", e)
@@ -1104,6 +1107,7 @@ await WtaDirectory.write('exports/image.png', pngBytes);
         if (!capabilities.notification) return false
         return try {
             NotificationManagerCompat.from(context).cancel(tag.hashCode())
+            cancelBridgeAlarm(tag)
             true
         } catch (e: Exception) {
             AppLogger.e("NativeBridge", "Failed to cancel notification", e)
@@ -1307,7 +1311,7 @@ await WtaDirectory.write('exports/image.png', pngBytes);
                 putExtra(BridgeAlarmReceiver.EXTRA_PLAY_SOUND, playSound)
             }
 
-            val requestCode = "$tag|$safeTriggerAt".hashCode()
+            val requestCode = tag.hashCode()
             val pendingIntent = PendingIntent.getBroadcast(
                 context,
                 requestCode,
@@ -1330,6 +1334,25 @@ await WtaDirectory.write('exports/image.png', pngBytes);
         } catch (e: Exception) {
             AppLogger.e("NativeBridge", "Failed to schedule bridge alarm", e)
             false
+        }
+    }
+
+    private fun cancelBridgeAlarm(tag: String) {
+        try {
+            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+            val intent = Intent(context, BridgeAlarmReceiver::class.java).apply {
+                action = BridgeAlarmReceiver.ACTION_SCHEDULED_NOTIFICATION
+            }
+            val pending = PendingIntent.getBroadcast(
+                context,
+                tag.hashCode(),
+                intent,
+                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+            ) ?: return
+            alarmManager.cancel(pending)
+            pending.cancel()
+        } catch (e: Exception) {
+            AppLogger.w("NativeBridge", "Failed to cancel bridge alarm", e)
         }
     }
 
