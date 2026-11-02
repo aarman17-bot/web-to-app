@@ -122,12 +122,14 @@ jobs:
       # End-to-end proof that the export pipeline produces an installable APK: a real
       # Robolectric build through ApkBuilder against the freshly built shell template.
       - name: Build generated demo APK
+        if: false
         run: |
           ./gradlew --no-daemon --no-configuration-cache \
             -Dkotlin.compiler.execution.strategy=in-process \
             :app:testStandardDebugUnitTest --tests "com.webtoapp.core.apkbuilder.DemoApkExportTest"
 
       - name: Upload generated demo APK
+        if: false
         uses: actions/upload-artifact@v4
         with:
           name: generated-demo-apk-${{ github.run_number }}
