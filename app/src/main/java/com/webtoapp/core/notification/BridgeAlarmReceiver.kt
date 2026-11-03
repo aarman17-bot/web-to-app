@@ -7,6 +7,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -23,10 +24,12 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
         const val EXTRA_TAG = "bridge_notif_tag"
         const val EXTRA_DEEP_LINK = "bridge_notif_deep_link"
         const val EXTRA_PLAY_SOUND = "bridge_notif_play_sound"
+        const val EXTRA_WAKE_SCREEN = "bridge_notif_wake_screen"
 
         private const val DEFAULT_CHANNEL_ID = "webapp_bridge_notifications"
         private const val DEFAULT_CHANNEL_NAME = "Web App Notifications"
         private const val TAG = "BridgeAlarmReceiver"
+        private const val WAKE_DURATION_MS = 15_000L
 
         // ---- Reminder channels -------------------------------------------------
         // These ids are permanent. Android keys the user's per-channel settings
@@ -75,6 +78,28 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
                 }
             } catch (e: Exception) {
                 AppLogger.e(TAG, "Failed to create reminder channels", e)
+            }
+        }
+
+        /**
+         * Turns the screen on for a short time. Needs the WAKE_LOCK permission in
+         * the manifest; without it Android throws SecurityException, which is
+         * caught here so the notification itself is never affected.
+         */
+        @Suppress("DEPRECATION")
+        private fun wakeScreenBriefly(context: Context) {
+            try {
+                val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    ?: return
+                val wakeLock = powerManager.newWakeLock(
+                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
+                        PowerManager.ACQUIRE_CAUSES_WAKEUP or
+                        PowerManager.ON_AFTER_RELEASE,
+                    "$TAG:wake"
+                )
+                wakeLock.acquire(WAKE_DURATION_MS)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to wake screen", e)
             }
         }
 
@@ -180,8 +205,10 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
             val tag = intent.getStringExtra(EXTRA_TAG) ?: ""
             val deepLink = intent.getStringExtra(EXTRA_DEEP_LINK) ?: ""
             val playSound = intent.getBooleanExtra(EXTRA_PLAY_SOUND, true)
+            val wakeScreen = intent.getBooleanExtra(EXTRA_WAKE_SCREEN, false)
 
-            postNotification(context, title, body, tag, channelId, deepLink, playSound)
+            val posted = postNotification(context, title, body, tag, channelId, deepLink, playSound)
+            if (posted && wakeScreen) wakeScreenBriefly(context)
             AppLogger.d(TAG, "Scheduled notification fired: title=$title, tag=$tag")
         } catch (e: Exception) {
             AppLogger.e(TAG, "onReceive failed", e)
