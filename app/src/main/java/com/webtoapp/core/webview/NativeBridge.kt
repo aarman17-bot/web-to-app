@@ -1085,6 +1085,11 @@ await WtaDirectory.write('exports/image.png', pngBytes);
             val deepLink = json.optString("deepLink", "")
             val playSound = json.optBoolean("playSound", true)
             val wakeScreen = json.optBoolean("wakeScreen", false)
+            val soundKey = json.optString("soundKey", "")
+            val sound2Key = json.optString("sound2Key", "")
+            val soundVol = json.optDouble("soundVol", 1.0).toFloat().coerceIn(0f, 1f)
+            val speakText = json.optString("speak", "")
+            val speakGapMs = json.optLong("speakGapMs", 3500L).coerceIn(0L, 10_000L)
             val delaySec = json.optLong("delaySec", 0L)
             val triggerAt = json.optLong("triggerAt", 0L)
 
@@ -1096,9 +1101,63 @@ await WtaDirectory.write('exports/image.png', pngBytes);
             }
 
             BridgeAlarmReceiver.ensureChannels(context)
-            scheduleBridgeAlarm(triggerAtMillis, title, body, tag, channelId, deepLink, playSound, wakeScreen)
+            scheduleBridgeAlarm(triggerAtMillis, title, body, tag, channelId, deepLink, playSound, wakeScreen, soundKey, sound2Key, soundVol, speakText, speakGapMs)
         } catch (e: Exception) {
             AppLogger.e("NativeBridge", "Failed to schedule notification", e)
+            false
+        }
+    }
+
+    /**
+     * Stores a WAV file (base64) rendered by the page, so the alarm receiver can
+     * play it later even when the page is not running.
+     */
+    @JavascriptInterface
+    fun saveBridgeSound(key: String, base64Wav: String): Boolean {
+        if (!capabilities.notificationScheduled) return false
+        return try {
+            val safeKey = key.filter { it.isLetterOrDigit() || it == '_' }.take(60)
+            if (safeKey.isEmpty()) return false
+            val bytes = Base64.decode(base64Wav, Base64.DEFAULT)
+            if (bytes.size < 64 || bytes.size > 8_000_000) return false
+            val file = BridgeAlarmReceiver.soundFile(context, safeKey)
+            file.parentFile?.mkdirs()
+            file.writeBytes(bytes)
+            true
+        } catch (e: Exception) {
+            AppLogger.e("NativeBridge", "Failed to save bridge sound", e)
+            false
+        }
+    }
+
+    /** Plays saved sound(s) right now, same code path the alarm uses (for the in-app test button). */
+    @JavascriptInterface
+    fun playBridgeSound(key1: String, key2: String, volume: Double, gapMs: Double): Boolean {
+        if (!capabilities.notificationScheduled) return false
+        return try {
+            val clean = { k: String -> k.filter { it.isLetterOrDigit() || it == '_' }.take(60) }
+            val f1 = BridgeAlarmReceiver.soundFile(context, clean(key1))
+            if (!f1.isFile) return false
+            val f2 = if (key2.isNotBlank()) BridgeAlarmReceiver.soundFile(context, clean(key2)) else null
+            BridgeAlarmReceiver.playAppSound(
+                context, f1, volume.toFloat().coerceIn(0f, 1f), f2, "",
+                gapMs.toLong().coerceIn(0L, 10_000L), null
+            )
+            true
+        } catch (e: Exception) {
+            AppLogger.e("NativeBridge", "Failed to play bridge sound", e)
+            false
+        }
+    }
+
+    @JavascriptInterface
+    fun deleteBridgeSound(key: String): Boolean {
+        if (!capabilities.notificationScheduled) return false
+        return try {
+            val safeKey = key.filter { it.isLetterOrDigit() || it == '_' }.take(60)
+            if (safeKey.isEmpty()) return false
+            BridgeAlarmReceiver.soundFile(context, safeKey).delete()
+        } catch (e: Exception) {
             false
         }
     }
@@ -1296,7 +1355,12 @@ await WtaDirectory.write('exports/image.png', pngBytes);
         channelId: String,
         deepLink: String,
         playSound: Boolean,
-        wakeScreen: Boolean = false
+        wakeScreen: Boolean = false,
+        soundKey: String = "",
+        sound2Key: String = "",
+        soundVol: Float = 1f,
+        speakText: String = "",
+        speakGapMs: Long = 3500L
     ): Boolean {
         return try {
             val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
@@ -1312,6 +1376,11 @@ await WtaDirectory.write('exports/image.png', pngBytes);
                 putExtra(BridgeAlarmReceiver.EXTRA_DEEP_LINK, deepLink)
                 putExtra(BridgeAlarmReceiver.EXTRA_PLAY_SOUND, playSound)
                 putExtra(BridgeAlarmReceiver.EXTRA_WAKE_SCREEN, wakeScreen)
+                putExtra(BridgeAlarmReceiver.EXTRA_SOUND_KEY, soundKey)
+                putExtra(BridgeAlarmReceiver.EXTRA_SOUND2_KEY, sound2Key)
+                putExtra(BridgeAlarmReceiver.EXTRA_SOUND_VOL, soundVol)
+                putExtra(BridgeAlarmReceiver.EXTRA_SPEAK, speakText)
+                putExtra(BridgeAlarmReceiver.EXTRA_SPEAK_GAP, speakGapMs)
             }
 
             val requestCode = tag.hashCode()
