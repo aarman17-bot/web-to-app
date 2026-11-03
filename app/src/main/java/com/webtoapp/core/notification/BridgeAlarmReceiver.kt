@@ -6,12 +6,21 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.MediaPlayer
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.webtoapp.core.logging.AppLogger
+import java.io.File
+import java.util.Locale
 
 class BridgeAlarmReceiver : BroadcastReceiver() {
 
@@ -25,11 +34,18 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
         const val EXTRA_DEEP_LINK = "bridge_notif_deep_link"
         const val EXTRA_PLAY_SOUND = "bridge_notif_play_sound"
         const val EXTRA_WAKE_SCREEN = "bridge_notif_wake_screen"
+        const val EXTRA_SOUND_KEY = "bridge_notif_sound_key"
+        const val EXTRA_SOUND2_KEY = "bridge_notif_sound2_key"
+        const val EXTRA_SOUND_VOL = "bridge_notif_sound_vol"
+        const val EXTRA_SPEAK = "bridge_notif_speak"
+        const val EXTRA_SPEAK_GAP = "bridge_notif_speak_gap"
 
         private const val DEFAULT_CHANNEL_ID = "webapp_bridge_notifications"
         private const val DEFAULT_CHANNEL_NAME = "Web App Notifications"
         private const val TAG = "BridgeAlarmReceiver"
         private const val WAKE_DURATION_MS = 15_000L
+        private const val PLAY_MAX_MS = 25_000L
+        const val SILENT_CHANNEL_ID = "app_sound_reminders"
 
         // ---- Reminder channels -------------------------------------------------
         // These ids are permanent. Android keys the user's per-channel settings
@@ -52,6 +68,35 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
 
         private const val MANAGED_CHANNEL_DESCRIPTION =
             "برای تغییر صدا، همین دسته را در تنظیمات اعلان گوشی باز کنید."
+
+        fun soundFile(context: Context, key: String): File =
+            File(File(context.filesDir, "bridge_sounds"), "$key.wav")
+
+        /**
+         * One extra silent channel, used when the app itself plays the sound.
+         * Created once; an existing channel is never touched.
+         */
+        fun ensureSilentChannel(context: Context) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            try {
+                val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                    ?: return
+                if (manager.getNotificationChannel(SILENT_CHANNEL_ID) != null) return
+                val channel = NotificationChannel(
+                    SILENT_CHANNEL_ID,
+                    "یادآور با صدای اپ",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "این دسته بی‌صداست؛ صدا را خود اپ پخش می‌کند. صدا را از داخل اپ عوض کنید."
+                    setSound(null, null)
+                    enableVibration(false)
+                    setShowBadge(true)
+                }
+                manager.createNotificationChannel(channel)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to create silent channel", e)
+            }
+        }
 
         fun isManagedChannel(channelId: String): Boolean =
             MANAGED_CHANNELS.any { it.first == channelId }
@@ -103,6 +148,129 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
             }
         }
 
+        /**
+         * Plays the saved sound, then (after gapMs) an optional second sound or
+         * spoken text. Calls pending.finish() when done or after a hard timeout.
+         */
+        fun playAppSound(
+            context: Context,
+            file: File,
+            volume: Float,
+            file2: File?,
+            speak: String,
+            gapMs: Long,
+            pending: BroadcastReceiver.PendingResult?
+        ) {
+            val app = context.applicationContext
+            val handler = Handler(Looper.getMainLooper())
+            var finished = false
+            var wakeLock: PowerManager.WakeLock? = null
+            try {
+                val pm = app.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$TAG:play")
+                wakeLock?.setReferenceCounted(false)
+                wakeLock?.acquire(PLAY_MAX_MS + 2_000L)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to hold wake lock for sound", e)
+            }
+
+            fun finish() {
+                if (finished) return
+                finished = true
+                try { wakeLock?.release() } catch (_: Exception) {}
+                try { pending?.finish() } catch (_: Exception) {}
+            }
+            handler.postDelayed({ finish() }, PLAY_MAX_MS)
+
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+
+            fun speakNow() {
+                if (speak.isBlank() || finished) {
+                    finish()
+                    return
+                }
+                var tts: TextToSpeech? = null
+                try {
+                    tts = TextToSpeech(app) { status ->
+                        val engine = tts
+                        if (engine == null || status != TextToSpeech.SUCCESS) {
+                            engine?.shutdown()
+                            finish()
+                            return@TextToSpeech
+                        }
+                        val lang = engine.setLanguage(Locale("fa", "IR"))
+                        if (lang == TextToSpeech.LANG_MISSING_DATA || lang == TextToSpeech.LANG_NOT_SUPPORTED) {
+                            AppLogger.w(TAG, "Persian TTS voice is not available")
+                            engine.shutdown()
+                            finish()
+                            return@TextToSpeech
+                        }
+                        engine.setAudioAttributes(attrs)
+                        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                            override fun onStart(utteranceId: String?) {}
+                            override fun onDone(utteranceId: String?) {
+                                engine.shutdown()
+                                finish()
+                            }
+                            @Deprecated("Deprecated in Java")
+                            override fun onError(utteranceId: String?) {
+                                engine.shutdown()
+                                finish()
+                            }
+                        })
+                        val params = Bundle().apply {
+                            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume)
+                        }
+                        engine.speak(speak, TextToSpeech.QUEUE_FLUSH, params, "bridge_speak")
+                    }
+                } catch (e: Exception) {
+                    AppLogger.e(TAG, "TTS failed", e)
+                    finish()
+                }
+            }
+
+            fun playFile(f: File, onDone: () -> Unit) {
+                val player = MediaPlayer()
+                try {
+                    player.setAudioAttributes(attrs)
+                    player.setDataSource(f.absolutePath)
+                    player.setVolume(volume, volume)
+                    player.setOnCompletionListener { mp ->
+                        mp.release()
+                        onDone()
+                    }
+                    player.setOnErrorListener { mp, _, _ ->
+                        mp.release()
+                        onDone()
+                        true
+                    }
+                    player.prepare()
+                    player.start()
+                } catch (e: Exception) {
+                    AppLogger.e(TAG, "Failed to play sound file", e)
+                    try { player.release() } catch (_: Exception) {}
+                    onDone()
+                }
+            }
+
+            fun afterFirst() {
+                if (file2 != null && file2.isFile && file2.length() > 44L) {
+                    handler.postDelayed({
+                        if (!finished) playFile(file2) { finish() }
+                    }, gapMs)
+                } else if (speak.isNotBlank()) {
+                    handler.postDelayed({ speakNow() }, gapMs)
+                } else {
+                    finish()
+                }
+            }
+
+            playFile(file) { afterFirst() }
+        }
+
         fun postNotification(
             context: Context,
             title: String,
@@ -124,12 +292,13 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
                 }
 
                 val effectiveChannelId = channelId.ifBlank { DEFAULT_CHANNEL_ID }
-                val managed = isManagedChannel(effectiveChannelId)
+                val managed = isManagedChannel(effectiveChannelId) || effectiveChannelId == SILENT_CHANNEL_ID
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     if (managed) {
                         // Fixed channels: created once, never re-configured here.
                         ensureChannels(context)
+                        ensureSilentChannel(context)
                     } else {
                         // Legacy behaviour for the default channel and any other id.
                         val importance = if (playSound) {
@@ -198,6 +367,7 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION_SCHEDULED_NOTIFICATION) return
 
+        var pending: PendingResult? = null
         try {
             val title = intent.getStringExtra(EXTRA_TITLE) ?: "Notification"
             val body = intent.getStringExtra(EXTRA_BODY) ?: ""
@@ -206,12 +376,33 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
             val deepLink = intent.getStringExtra(EXTRA_DEEP_LINK) ?: ""
             val playSound = intent.getBooleanExtra(EXTRA_PLAY_SOUND, true)
             val wakeScreen = intent.getBooleanExtra(EXTRA_WAKE_SCREEN, false)
+            val soundKey = intent.getStringExtra(EXTRA_SOUND_KEY) ?: ""
+            val sound2Key = intent.getStringExtra(EXTRA_SOUND2_KEY) ?: ""
+            val soundVol = intent.getFloatExtra(EXTRA_SOUND_VOL, 1f)
+            val speakText = intent.getStringExtra(EXTRA_SPEAK) ?: ""
+            val speakGap = intent.getLongExtra(EXTRA_SPEAK_GAP, 3500L)
 
-            val posted = postNotification(context, title, body, tag, channelId, deepLink, playSound)
+            val file: File? = if (soundKey.isNotBlank()) soundFile(context, soundKey) else null
+            val file2: File? = if (sound2Key.isNotBlank()) soundFile(context, sound2Key) else null
+            val useAppSound = file != null && file.isFile && file.length() > 44L
+            if (useAppSound) pending = goAsync()
+
+            val posted = postNotification(
+                context, title, body, tag,
+                if (useAppSound) SILENT_CHANNEL_ID else channelId,
+                deepLink, playSound
+            )
             if (posted && wakeScreen) wakeScreenBriefly(context)
+            if (posted && useAppSound && file != null) {
+                val p = pending
+                pending = null
+                playAppSound(context, file, soundVol, file2, speakText, speakGap, p)
+            }
             AppLogger.d(TAG, "Scheduled notification fired: title=$title, tag=$tag")
         } catch (e: Exception) {
             AppLogger.e(TAG, "onReceive failed", e)
+        } finally {
+            try { pending?.finish() } catch (_: Exception) {}
         }
     }
 }
