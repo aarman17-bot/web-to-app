@@ -1084,6 +1084,7 @@ await WtaDirectory.write('exports/image.png', pngBytes);
             val channelId = json.optString("channelId").ifBlank { "webapp_bridge_notifications" }
             val deepLink = json.optString("deepLink", "")
             val playSound = json.optBoolean("playSound", true)
+            val wakeScreen = json.optBoolean("wakeScreen", false)
             val delaySec = json.optLong("delaySec", 0L)
             val triggerAt = json.optLong("triggerAt", 0L)
 
@@ -1095,7 +1096,7 @@ await WtaDirectory.write('exports/image.png', pngBytes);
             }
 
             BridgeAlarmReceiver.ensureChannels(context)
-            scheduleBridgeAlarm(triggerAtMillis, title, body, tag, channelId, deepLink, playSound)
+            scheduleBridgeAlarm(triggerAtMillis, title, body, tag, channelId, deepLink, playSound, wakeScreen)
         } catch (e: Exception) {
             AppLogger.e("NativeBridge", "Failed to schedule notification", e)
             false
@@ -1294,7 +1295,8 @@ await WtaDirectory.write('exports/image.png', pngBytes);
         tag: String,
         channelId: String,
         deepLink: String,
-        playSound: Boolean
+        playSound: Boolean,
+        wakeScreen: Boolean = false
     ): Boolean {
         return try {
             val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
@@ -1309,6 +1311,7 @@ await WtaDirectory.write('exports/image.png', pngBytes);
                 putExtra(BridgeAlarmReceiver.EXTRA_TAG, tag)
                 putExtra(BridgeAlarmReceiver.EXTRA_DEEP_LINK, deepLink)
                 putExtra(BridgeAlarmReceiver.EXTRA_PLAY_SOUND, playSound)
+                putExtra(BridgeAlarmReceiver.EXTRA_WAKE_SCREEN, wakeScreen)
             }
 
             val requestCode = tag.hashCode()
