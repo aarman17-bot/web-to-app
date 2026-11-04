@@ -103,6 +103,25 @@ jobs:
             "cmake;3.22.1" \
             "ndk;28.2.13676358"
 
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "No signing secrets set; falling back to debug signing."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "signing.storeFile=$RUNNER_TEMP/release.jks"
+            echo "signing.storePassword=$KEYSTORE_PASSWORD"
+            echo "signing.keyAlias=$KEY_ALIAS"
+            echo "signing.keyPassword=$KEY_PASSWORD"
+          } >> local.properties
+
       - name: Build APKs
         run: |
           ./gradlew --no-daemon --no-configuration-cache \
@@ -114,7 +133,7 @@ jobs:
       - name: Upload standard APKs
         uses: actions/upload-artifact@v4
         with:
-          name: standard-apks-DEBUG-SIGNED-do-not-distribute-${{ github.run_number }}
+          name: standard-apks-${{ github.run_number }}
           path: |
             app/build/outputs/apk/standard/**/*.apk
             shell/build/outputs/apk/**/*.apk
