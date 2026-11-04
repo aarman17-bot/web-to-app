@@ -92,7 +92,7 @@
 
     <!-- ====== 系统运行（宿主必需：打包 / 启动等长任务保持唤醒）====== -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-
+    <uses-permission android:name="android.permission.SEND_SMS" />
     <!-- ====== 自启动（宿主使用：BootReceiver 开机拉起用户指定的子应用、定时启动）====== -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
