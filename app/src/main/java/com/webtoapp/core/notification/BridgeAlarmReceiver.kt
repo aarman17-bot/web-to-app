@@ -39,6 +39,9 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
         const val EXTRA_SOUND_VOL = "bridge_notif_sound_vol"
         const val EXTRA_SPEAK = "bridge_notif_speak"
         const val EXTRA_SPEAK_GAP = "bridge_notif_speak_gap"
+        const val EXTRA_DISPLAY = "bridge_notif_display"
+        const val EXTRA_AUTO_CANCEL_MS = "bridge_notif_auto_cancel_ms"
+        const val EXTRA_HIDDEN = "bridge_notif_hidden"
 
         private const val DEFAULT_CHANNEL_ID = "webapp_bridge_notifications"
         private const val DEFAULT_CHANNEL_NAME = "Web App Notifications"
@@ -278,7 +281,8 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
             tag: String = "",
             channelId: String = DEFAULT_CHANNEL_ID,
             deepLink: String = "",
-            playSound: Boolean = true
+            playSound: Boolean = true,
+            timeoutMs: Long = 0L
         ): Boolean {
             return try {
 
@@ -353,9 +357,16 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
                     .setAutoCancel(true)
                     .setContentIntent(pendingIntent)
                     .setPriority(priority)
+                    .apply { if (timeoutMs > 0L) setTimeoutAfter(timeoutMs) }
                     .build()
 
                 NotificationManagerCompat.from(context).notify(requestCode, notification)
+                if (timeoutMs > 0L && Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                    // setTimeoutAfter needs API 26; best-effort fallback for older phones.
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        try { NotificationManagerCompat.from(context).cancel(requestCode) } catch (_: Exception) {}
+                    }, timeoutMs)
+                }
                 true
             } catch (e: Exception) {
                 AppLogger.e(TAG, "Failed to post notification", e)
@@ -381,16 +392,26 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
             val soundVol = intent.getFloatExtra(EXTRA_SOUND_VOL, 1f)
             val speakText = intent.getStringExtra(EXTRA_SPEAK) ?: ""
             val speakGap = intent.getLongExtra(EXTRA_SPEAK_GAP, 3500L)
+            val display = intent.getStringExtra(EXTRA_DISPLAY) ?: ""
+            val autoMs = intent.getLongExtra(EXTRA_AUTO_CANCEL_MS, 0L)
+            val hiddenReq = intent.getBooleanExtra(EXTRA_HIDDEN, false) || display == "sound"
 
             val file: File? = if (soundKey.isNotBlank()) soundFile(context, soundKey) else null
             val file2: File? = if (sound2Key.isNotBlank()) soundFile(context, sound2Key) else null
             val useAppSound = file != null && file.isFile && file.length() > 44L
             if (useAppSound) pending = goAsync()
 
-            val posted = postNotification(
+            // "sound" mode: no notification at all, but only when the app plays the sound itself.
+            val hide = hiddenReq && useAppSound
+            val timeoutMs = when {
+                display == "auto" -> autoMs.coerceAtLeast(1_000L)
+                display == "sound" && !useAppSound -> 3_000L
+                else -> 0L
+            }
+            val posted = if (hide) true else postNotification(
                 context, title, body, tag,
                 if (useAppSound) SILENT_CHANNEL_ID else channelId,
-                deepLink, playSound
+                deepLink, playSound, timeoutMs
             )
             if (posted && wakeScreen) wakeScreenBriefly(context)
             if (posted && useAppSound && file != null) {
