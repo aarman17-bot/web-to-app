@@ -912,6 +912,91 @@ await WtaDirectory.write('exports/image.png', pngBytes);
         false
     }
 
+    // ---- SMS send/delivery results (page: sendSmsTagged + getSmsDeliveryReports) ----------
+
+    /**
+     * Like [sendSms] but also asks Android for the send result and the carrier's delivery report.
+     * Returns "queued" (the real result comes later through [getSmsDeliveryReports]) or
+     * "no_permission" / "invalid" / "error".
+     */
+    @JavascriptInterface
+    fun sendSmsTagged(phone: String, body: String, tag: String): String =
+        com.webtoapp.core.notification.SmsSender.sendTagged(context, phone, body, tag)
+
+    /**
+     * JSON array: [{"tag","stage":"sent"|"delivered","status":"ok"|"failed"|"delivered","reason","at"}].
+     * Kept until [clearSmsDeliveryReports] is called, so results that arrive while the page is closed are not lost.
+     */
+    @JavascriptInterface
+    fun getSmsDeliveryReports(): String = try {
+        com.webtoapp.core.notification.SmsReports.read(context)
+    } catch (e: Exception) {
+        "[]"
+    }
+
+    @JavascriptInterface
+    fun clearSmsDeliveryReports(jsonTags: String): Boolean = try {
+        val arr = org.json.JSONArray(jsonTags)
+        val tags = (0 until arr.length()).map { arr.getString(it) }
+        com.webtoapp.core.notification.SmsReports.remove(context, tags)
+        true
+    } catch (e: Exception) {
+        false
+    }
+
+    // ---- Incoming-call monitor (caller-ID notification + missed-call SMS) -----------------
+
+    @JavascriptInterface
+    fun hasCallPerm(): Boolean = try {
+        com.webtoapp.core.notification.CallMonitor.hasPermissions(context)
+    } catch (e: Exception) {
+        false
+    }
+
+    @JavascriptInterface
+    fun askCallPerm(): Boolean {
+        if (hasCallPerm()) return true
+        val activity = context as? Activity ?: return false
+        scope.launch(Dispatchers.Main) {
+            try {
+                val perms = ArrayList<String>()
+                perms.add(android.Manifest.permission.READ_PHONE_STATE)
+                perms.add(android.Manifest.permission.READ_CALL_LOG)
+                perms.add(android.Manifest.permission.SEND_SMS)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    perms.add(android.Manifest.permission.POST_NOTIFICATIONS)
+                }
+                ActivityCompat.requestPermissions(activity, perms.toTypedArray(), 9003)
+            } catch (e: Exception) {
+                AppLogger.w("NativeBridge", "Call-permission request failed", e)
+            }
+        }
+        return false
+    }
+
+    /** The page's call settings + student directory (JSON). Stored on the phone so it works while the page is closed. */
+    @JavascriptInterface
+    fun setCallConfig(json: String): Boolean =
+        com.webtoapp.core.notification.CallMonitor.setConfig(context, json)
+
+    /** JSON array of incoming-call events not yet cleared by the page. */
+    @JavascriptInterface
+    fun getCallEvents(): String = try {
+        com.webtoapp.core.notification.CallMonitor.readEvents(context)
+    } catch (e: Exception) {
+        "[]"
+    }
+
+    @JavascriptInterface
+    fun clearCallEvents(jsonIds: String): Boolean = try {
+        val arr = org.json.JSONArray(jsonIds)
+        val ids = (0 until arr.length()).map { arr.getString(it) }
+        com.webtoapp.core.notification.CallMonitor.clearEvents(context, ids)
+        true
+    } catch (e: Exception) {
+        false
+    }
+
     @JavascriptInterface
     fun requestNotificationPermission(): String {
         if (!capabilities.notification) return "denied"
