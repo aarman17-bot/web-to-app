@@ -487,7 +487,7 @@
             </intent-filter>
         </receiver>
 
-<receiver
+<!--<receiver
     android:name="com.webtoapp.core.notification.SmsStatusReceiver"
     android:exported="false" />
 
@@ -497,7 +497,7 @@
     <intent-filter>
         <action android:name="android.intent.action.PHONE_STATE" />
     </intent-filter>
-</receiver>        <!--
+</receiver> -->       <!--
             BridgeAlarmReceiver - 通知调度（页内 Web Notification.scheduleNotification）。
             宿主与生成的 APK 均使用（NativeBridge 为 shell 同步代码），shell 模板清单
             必须保留同名声明，两边需同步修改。
