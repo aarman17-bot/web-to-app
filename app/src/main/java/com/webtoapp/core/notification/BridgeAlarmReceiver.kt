@@ -7,6 +7,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
 import android.os.Bundle
@@ -51,6 +52,8 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
         private const val WAKE_DURATION_MS = 15_000L
         private const val PLAY_MAX_MS = 25_000L
         const val SILENT_CHANNEL_ID = "app_sound_reminders"
+        private const val CALL_WAIT_MAX_MS = 8_000L
+        private const val CALL_POLL_MS = 500L
 
         // ---- Reminder channels -------------------------------------------------
         // These ids are permanent. Android keys the user's per-channel settings
@@ -227,6 +230,22 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
         }
 
         /**
+         * True while the phone is ringing or a call (normal or VoIP) is active.
+         * Uses the audio mode, which needs no permission. Any failure counts as "no call",
+         * so a bell is never lost because of a problem here.
+         */
+        fun isInCall(context: Context): Boolean = try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val mode = am?.mode ?: AudioManager.MODE_NORMAL
+            mode == AudioManager.MODE_IN_CALL ||
+                mode == AudioManager.MODE_IN_COMMUNICATION ||
+                mode == AudioManager.MODE_RINGTONE ||
+                (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && mode == AudioManager.MODE_CALL_SCREENING)
+        } catch (e: Exception) {
+            false
+        }
+
+        /**
          * Plays the saved sound, then (after gapMs) an optional second sound or
          * spoken text. Calls pending.finish() when done or after a hard timeout.
          */
@@ -237,10 +256,36 @@ class BridgeAlarmReceiver : BroadcastReceiver() {
             file2: File?,
             speak: String,
             gapMs: Long,
-            pending: BroadcastReceiver.PendingResult?
+            pending: BroadcastReceiver.PendingResult?,
+            callChecked: Boolean = false
         ) {
             val app = context.applicationContext
             val handler = Handler(Looper.getMainLooper())
+
+            // A call is in progress: never play a bell over it. Wait a few seconds in case
+            // the call ends right now; otherwise skip the sound (the notification stays).
+            if (!callChecked && isInCall(app)) {
+                val startedAt = System.currentTimeMillis()
+                val poll = object : Runnable {
+                    override fun run() {
+                        try {
+                            if (!isInCall(app)) {
+                                playAppSound(context, file, volume, file2, speak, gapMs, pending, true)
+                            } else if (System.currentTimeMillis() - startedAt >= CALL_WAIT_MAX_MS) {
+                                AppLogger.i(TAG, "Bell sound skipped: phone call in progress")
+                                try { pending?.finish() } catch (_: Exception) {}
+                            } else {
+                                handler.postDelayed(this, CALL_POLL_MS)
+                            }
+                        } catch (e: Exception) {
+                            AppLogger.e(TAG, "call wait failed", e)
+                            try { pending?.finish() } catch (_: Exception) {}
+                        }
+                    }
+                }
+                handler.postDelayed(poll, CALL_POLL_MS)
+                return
+            }
             var finished = false
             var wakeLock: PowerManager.WakeLock? = null
             try {
