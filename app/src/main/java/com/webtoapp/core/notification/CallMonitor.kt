@@ -57,7 +57,7 @@ object CallMonitor {
     private const val TAG = "CallMonitor"
 
     /** Shown in the app's "health & test" panel so you can see at a glance that the new APK is really installed. */
-    const val BUILD_TAG = "2026-11-08.8"
+    const val BUILD_TAG = "2026-11-08.12"
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -156,7 +156,10 @@ object CallMonitor {
         return "direct"
     }
 
-    private class Person(val name: String, val info: String, val teacher: Boolean = false, val lead: Boolean = false)
+    private class Person(
+        val name: String, val info: String, val teacher: Boolean = false, val lead: Boolean = false,
+        val beats: String = "" // term strip: markers h/d/c/m + dots g/r/e/u/v (see parseBeats)
+    )
 
     private var nameCacheKey = ""
     private var nameCacheVal: String? = null
@@ -242,7 +245,7 @@ object CallMonitor {
         val dir = cfg.optJSONArray("directory") ?: return null
         for (i in 0 until dir.length()) {
             val o = dir.optJSONObject(i) ?: continue
-            if (o.optString("p") == mobile) return Person(o.optString("n"), o.optString("i"), o.optInt("t", 0) == 1, o.optInt("l", 0) == 1)
+            if (o.optString("p") == mobile) return Person(o.optString("n"), o.optString("i"), o.optInt("t", 0) == 1, o.optInt("l", 0) == 1, o.optString("b"))
         }
         return null
     }
@@ -385,6 +388,7 @@ object CallMonitor {
             TelephonyManager.EXTRA_STATE_RINGING -> {
                 var at = p.getLong("r_at", 0L)
                 if (at == 0L || now - at > 120_000L) {
+                    hideOverlay() // a new ring replaces any leftover missed-call card
                     at = now
                     p.edit().putLong("r_at", at).putLong("r_ans", 0L).putString("r_num", "").putBoolean("r_shown", false).apply()
                 }
@@ -409,9 +413,9 @@ object CallMonitor {
             }
             TelephonyManager.EXTRA_STATE_IDLE -> {
                 val at = p.getLong("r_at", 0L)
+                cancelNotification(app) // hides the ring card first; a missed-call card may be shown right after
                 if (at > 0L) finishCall(app, cfg, p.getString("r_num", "") ?: "", p.getLong("r_ans", 0L), now)
                 p.edit().putLong("r_at", 0L).putLong("r_ans", 0L).putString("r_num", "").putBoolean("r_shown", false).apply()
-                cancelNotification(app)
             }
         }
     }
@@ -441,6 +445,7 @@ object CallMonitor {
             try { maybeSendMissedSms(context, cfg, c, ev) } catch (e: Exception) { AppLogger.e(TAG, "missed SMS failed", e) }
         }
         addEvent(context, ev)
+        if (!answered && cfg.optBoolean("popup", false)) showMissedCard(context, cfg, c)
     }
 
     // ---- on-screen caller card (drawn over the phone's own call screen) -------------
@@ -472,7 +477,71 @@ object CallMonitor {
         overlayHandler.post { removeOverlayNow() }
     }
 
+    private fun kindLabelOf(person: Person?, contact: String?): String = when {
+        person?.teacher == true -> "👨‍🏫 مدرس"
+        person?.lead == true -> "🎯 علاقه‌مند"
+        person != null -> "🎓 شاگرد"
+        contact != null -> "📇 مخاطبِ گوشی"
+        else -> "❓ ناشناس"
+    }
+
+    private fun kindColorOf(person: Person?, contact: String?): Int = when {
+        person?.teacher == true -> 0xF21565C0.toInt()
+        person?.lead == true -> 0xF2E65100.toInt()
+        person != null -> 0xF22E7D32.toInt()
+        contact != null -> 0xF2455A64.toInt()
+        else -> 0xF2424242.toInt()
+    }
+
+    private fun histTextOf(h: CallHistory): String =
+        if (h.total == 0) "اولین تماس ثبت‌شده" else faDigits(
+            "تماس‌های قبلی: ${h.total}" + (if (h.missed > 0) " (${h.missed} بی‌پاسخ)" else "") +
+                " · آخرین: " + whenText(h.last)
+        )
+
+    /** Card that stays after an unanswered call, with call-back / SMS buttons, until closed (or 15 min). */
+    private fun showMissedCard(context: Context, cfg: JSONObject, c: Caller) {
+        try {
+            val person = lookup(cfg, c.caller)
+            val contact = if (person == null) contactName(context, c.caller) else null
+            val who = person?.name ?: contact ?: c.caller
+            val route = if (c.viaAcademy) "🏫 " + (cfg.optJSONObject("academy")?.optString("label") ?: "آکادمی") else "📞 شمارهٔ ساده"
+            val hist = callHistory(context, cfg, c.caller)
+            val info = person?.info?.takeIf { it.isNotBlank() } ?: c.caller
+            showOverlay(
+                context, "📵 تماس بی‌پاسخ · ${kindLabelOf(person, contact)} · $route", who, info, histTextOf(hist),
+                person?.beats ?: "", kindColorOf(person, contact), c.caller, true,
+                if (person == null) "🎯 ثبت به‌عنوان علاقه‌مند" else "📂 باز کردن در اپ"
+            )
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "missed card failed", e)
+        }
+    }
+
     private class CallHistory(val total: Int, val missed: Int, val last: Long)
+
+    /**
+     * Session strip sent by the page. Marker letters come before the dot they belong to:
+     *   h = schedule moved (hour), d = schedule moved (day), c = cancelled class without a make-up date, m = make-up session (ج)
+     * Dot letters: g = present, r = absent, e = not held yet, u = cancelled class with a make-up planned (↻), v = voided session (✕)
+     */
+    private class Dot(val state: Char, val marks: String)
+
+    private fun parseBeats(beats: String): List<Dot> {
+        val out = ArrayList<Dot>()
+        val pending = StringBuilder()
+        for (ch in beats) {
+            when (ch) {
+                'h', 'd', 'c', 'm' -> pending.append(ch)
+                'g', 'r', 'e', 'u', 'v' -> {
+                    out.add(Dot(ch, pending.toString()))
+                    pending.setLength(0)
+                }
+                else -> {}
+            }
+        }
+        return out
+    }
 
     /** Earlier incoming calls from this caller, read from the phone's call log (forwarded "+9821…" numbers are unwrapped). */
     private fun callHistory(context: Context, cfg: JSONObject, mobile: String): CallHistory {
@@ -536,7 +605,8 @@ object CallMonitor {
 
     private fun showOverlay(
         context: Context, header: String, name: String, info: String,
-        history: String, color: Int, phone: String
+        history: String, beats: String, color: Int, phone: String,
+        sticky: Boolean = false, openLabel: String = "📂 باز کردن در اپ"
     ) {
         try {
             if (!canShowOverlay(context)) return
@@ -555,6 +625,12 @@ object CallMonitor {
                     bg.cornerRadius = 18 * d
                     box.background = bg
 
+                    val launch = app.packageManager.getLaunchIntentForPackage(app.packageName)?.apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                        // Same extra as the notification: the page opens the caller's student page.
+                        if (phone.isNotBlank()) putExtra("wta_open_phone", phone)
+                    }
+
                     fun line(txt: String, sizeSp: Float, argb: Int, bold: Boolean) {
                         if (txt.isBlank()) return
                         val tv = android.widget.TextView(app)
@@ -568,38 +644,172 @@ object CallMonitor {
                     line(header, 13f, 0xFFE8EAED.toInt(), false)
                     line(name, 22f, 0xFFFFFFFF.toInt(), true)
                     line(info, 14f, 0xFFFFFFFF.toInt(), false)
+
+                    val dots = parseBeats(beats)
+                    if (dots.isNotEmpty()) {
+                        // Term sessions like the dashed strip in the app: green = present, red = absent, dashed = not held yet,
+                        // "/" = schedule moved or cancelled, ج = make-up session, ↻ = cancelled class with a make-up, ✕ = voided.
+                        val row = android.widget.LinearLayout(app)
+                        row.orientation = android.widget.LinearLayout.HORIZONTAL
+                        row.gravity = android.view.Gravity.CENTER
+                        val avail = app.resources.displayMetrics.widthPixels - (32 * d) - 2 * pad
+                        val n = dots.size
+                        val size = Math.min(16 * d, avail / (n * 1.45f)).toInt().coerceAtLeast((6 * d).toInt())
+                        val gap = (size * 0.22f).toInt().coerceAtLeast(1)
+                        val sw = (1.2f * d).toInt().coerceAtLeast(1)
+                        val anyMark = dots.any { it.marks.isNotEmpty() }
+                        for (dot in dots) {
+                            val col = android.widget.LinearLayout(app)
+                            col.orientation = android.widget.LinearLayout.VERTICAL
+                            col.gravity = android.view.Gravity.CENTER_HORIZONTAL
+                            if (anyMark) {
+                                val mk = android.widget.TextView(app)
+                                val sb = android.text.SpannableStringBuilder()
+                                for (m in dot.marks) {
+                                    val start = sb.length
+                                    sb.append(if (m == 'm') "ج" else "/")
+                                    val colr: Int = when (m) {
+                                        'h' -> 0xFFFFD54F.toInt()
+                                        'd' -> 0xFF4FC3F7.toInt()
+                                        'c' -> 0xFFFF8A65.toInt()
+                                        else -> 0xFFFFFF8D.toInt()
+                                    }
+                                    sb.setSpan(
+                                        android.text.style.ForegroundColorSpan(colr), start, sb.length,
+                                        android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                                    )
+                                }
+                                mk.text = sb
+                                mk.textSize = 11f
+                                mk.setTypeface(mk.typeface, android.graphics.Typeface.BOLD)
+                                mk.gravity = android.view.Gravity.CENTER
+                                mk.setSingleLine(true)
+                                col.addView(mk)
+                            }
+                            val sq = android.widget.TextView(app)
+                            sq.gravity = android.view.Gravity.CENTER
+                            sq.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, size * 0.62f)
+                            val gd = android.graphics.drawable.GradientDrawable()
+                            gd.cornerRadius = size * 0.28f
+                            when (dot.state) {
+                                'g' -> { gd.setColor(0xFF00E676.toInt()); gd.setStroke(sw, 0xFFFFFFFF.toInt()) }
+                                'r' -> { gd.setColor(0xFFFF5252.toInt()); gd.setStroke(sw, 0xFFFFFFFF.toInt()) }
+                                'u' -> {
+                                    gd.setColor(0x00000000); gd.setStroke(sw, 0xFFFFD54F.toInt(), 3 * d, 2 * d)
+                                    sq.text = "↻"; sq.setTextColor(0xFFFFD54F.toInt())
+                                }
+                                'v' -> {
+                                    gd.setColor(0x33000000); gd.setStroke(sw, 0x99FFFFFF.toInt())
+                                    sq.text = "✕"; sq.setTextColor(0xCCFFFFFF.toInt())
+                                }
+                                else -> { gd.setColor(0x00000000); gd.setStroke(sw, 0xCCFFFFFF.toInt(), 3 * d, 2 * d) }
+                            }
+                            sq.background = gd
+                            col.addView(sq, android.widget.LinearLayout.LayoutParams(size, size))
+                            val colLp = android.widget.LinearLayout.LayoutParams(
+                                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                            )
+                            colLp.setMargins(gap, 0, gap, 0)
+                            row.addView(col, colLp)
+                        }
+                        val rlp = android.widget.LinearLayout.LayoutParams(
+                            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                        )
+                        rlp.gravity = android.view.Gravity.CENTER_HORIZONTAL
+                        rlp.topMargin = (8 * d).toInt()
+                        row.layoutParams = rlp
+                        if (launch != null) {
+                            row.setOnClickListener {
+                                try { app.startActivity(launch) } catch (e: Exception) { AppLogger.w(TAG, "overlay open failed", e) }
+                                removeOverlayNow()
+                            }
+                        }
+                        box.addView(row)
+                        val held = dots.count { it.state == 'g' || it.state == 'r' }
+                        val absent = dots.count { it.state == 'r' }
+                        val total = dots.count { it.state == 'g' || it.state == 'r' || it.state == 'e' }
+                        line(
+                            faDigits("$held از $total جلسه" + (if (absent > 0) " · $absent غیبت" else "")),
+                            12f, 0xFFE8EAED.toInt(), false
+                        )
+                        val legend = ArrayList<String>()
+                        if (dots.any { it.marks.contains('h') || it.marks.contains('d') || it.marks.contains('c') }) legend.add("/ جابجایی یا کنسلی")
+                        if (dots.any { it.marks.contains('m') }) legend.add("ج جبرانی")
+                        if (dots.any { it.state == 'u' }) legend.add("↻ جبرانیِ کنسلی")
+                        if (dots.any { it.state == 'v' }) legend.add("✕ لغو")
+                        if (legend.isNotEmpty()) line(legend.joinToString(" · "), 10f, 0xCCE8EAED.toInt(), false)
+                    }
                     line(history, 13f, 0xFFE8EAED.toInt(), false)
 
-                    val launch = app.packageManager.getLaunchIntentForPackage(app.packageName)?.apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                        // Same extra as the notification: the page opens the caller's student page.
-                        if (phone.isNotBlank()) putExtra("wta_open_phone", phone)
-                    }
-                    if (launch != null) {
-                        val btn = android.widget.TextView(app)
-                        btn.text = "📂 باز کردن در اپ"
-                        btn.setTextColor(0xFFFFFFFF.toInt())
-                        btn.textSize = 14f
-                        btn.setTypeface(btn.typeface, android.graphics.Typeface.BOLD)
-                        btn.gravity = android.view.Gravity.CENTER
+                    fun pill(label: String): android.widget.TextView {
+                        val b = android.widget.TextView(app)
+                        b.text = label
+                        b.setTextColor(0xFFFFFFFF.toInt())
+                        b.textSize = 13f
+                        b.setTypeface(b.typeface, android.graphics.Typeface.BOLD)
+                        b.gravity = android.view.Gravity.CENTER
                         val bb = android.graphics.drawable.GradientDrawable()
                         bb.setColor(0x33FFFFFF)
                         bb.cornerRadius = 12 * d
-                        btn.background = bb
+                        b.background = bb
                         val bp = (8 * d).toInt()
-                        btn.setPadding(bp * 2, bp, bp * 2, bp)
-                        val blp = android.widget.LinearLayout.LayoutParams(
-                            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
-                            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
-                        )
-                        blp.topMargin = (10 * d).toInt()
-                        btn.layoutParams = blp
-                        btn.setOnClickListener {
-                            try { app.startActivity(launch) } catch (e: Exception) { AppLogger.w(TAG, "overlay open failed", e) }
+                        b.setPadding(bp, bp, bp, bp)
+                        return b
+                    }
+                    fun go(i: Intent) {
+                        try {
+                            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            app.startActivity(i)
+                        } catch (e: Exception) {
+                            AppLogger.w(TAG, "overlay action failed", e)
+                        }
+                    }
+                    val btnRow = android.widget.LinearLayout(app)
+                    btnRow.orientation = android.widget.LinearLayout.HORIZONTAL
+                    val rowLp = android.widget.LinearLayout.LayoutParams(
+                        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+                    rowLp.topMargin = (10 * d).toInt()
+                    btnRow.layoutParams = rowLp
+                    fun addPill(label: String, onTap: () -> Unit) {
+                        val b = pill(label)
+                        val lp3 = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        lp3.setMargins((3 * d).toInt(), 0, (3 * d).toInt(), 0)
+                        b.layoutParams = lp3
+                        b.setOnClickListener {
+                            onTap()
                             removeOverlayNow()
                         }
-                        box.addView(btn)
+                        btnRow.addView(b)
                     }
+                    if (sticky) {
+                        addPill("📞 تماس") { go(Intent(Intent.ACTION_DIAL, android.net.Uri.parse("tel:" + phone))) }
+                        addPill("✉️ پیامک") { go(Intent(Intent.ACTION_SENDTO, android.net.Uri.parse("smsto:" + phone))) }
+                    }
+                    if (launch != null) addPill(openLabel) { try { app.startActivity(launch) } catch (e: Exception) { AppLogger.w(TAG, "overlay open failed", e) } }
+                    if (btnRow.childCount > 0) box.addView(btnRow)
+
+                    // root: the card plus a small close button in the corner
+                    val root = android.widget.FrameLayout(app)
+                    root.addView(box)
+                    val closeBtn = android.widget.TextView(app)
+                    closeBtn.text = "✕"
+                    closeBtn.setTextColor(0xFFFFFFFF.toInt())
+                    closeBtn.textSize = 16f
+                    closeBtn.gravity = android.view.Gravity.CENTER
+                    val cp = (8 * d).toInt()
+                    closeBtn.setPadding(cp * 2, cp, cp * 2, cp)
+                    val clp = android.widget.FrameLayout.LayoutParams(
+                        android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                        android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                        android.view.Gravity.TOP or android.view.Gravity.START
+                    )
+                    closeBtn.layoutParams = clp
+                    closeBtn.setOnClickListener { removeOverlayNow() }
+                    root.addView(closeBtn)
 
                     val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                         android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -619,9 +829,9 @@ object CallMonitor {
                     lp.y = (56 * d).toInt()
 
                     val wm = app.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
-                    wm.addView(box, lp)
-                    overlayView = box
-                    overlayHandler.postDelayed(overlayAutoHide, 90_000L)
+                    wm.addView(root, lp)
+                    overlayView = root
+                    overlayHandler.postDelayed(overlayAutoHide, if (sticky) 15 * 60_000L else 90_000L)
                 } catch (e: Exception) {
                     AppLogger.w(TAG, "overlay show failed", e)
                 }
@@ -661,35 +871,23 @@ object CallMonitor {
                 contact != null -> contact
                 else -> c.caller
             }
-            val title = (if (c.viaAcademy) "🏫 $label — " else "📞 مستقیم — ") + who
+            val title = (if (c.viaAcademy) "🏫 $label — " else "📞 ") + who
             val text = when {
                 person != null && person.info.isNotBlank() -> person.info
-                contact != null -> if (c.viaAcademy) "مخاطبِ گوشی — تماس به خطِ آکادمی (دایورت)" else "مخاطبِ گوشی — تماس مستقیم به خطِ شما"
+                contact != null -> if (c.viaAcademy) "مخاطبِ گوشی — تماس به خطِ آکادمی (دایورت)" else "مخاطبِ گوشی — شمارهٔ ساده (دایورت یا مستقیم)"
                 person == null -> "شمارهٔ ناشناس"
                 else -> c.caller
             }
             // on-screen card above the phone's call screen (needs "Appear on top")
-            val kindLabel = when {
-                person?.teacher == true -> "👨‍🏫 مدرس"
-                person?.lead == true -> "🎯 علاقه‌مند"
-                person != null -> "🎓 شاگرد"
-                contact != null -> "📇 مخاطبِ گوشی"
-                else -> "❓ ناشناس"
-            }
-            val kindColor = when {
-                person?.teacher == true -> 0xF21565C0.toInt()
-                person?.lead == true -> 0xF2E65100.toInt()
-                person != null -> 0xF22E7D32.toInt()
-                contact != null -> 0xF2455A64.toInt()
-                else -> 0xF2424242.toInt()
-            }
+            val kindLabel = kindLabelOf(person, contact)
+            val kindColor = kindColorOf(person, contact)
             val hist = callHistory(context, cfg, c.caller)
-            val histText = if (hist.total == 0) "اولین تماس ثبت‌شده" else faDigits(
-                "تماس‌های قبلی: ${hist.total}" + (if (hist.missed > 0) " (${hist.missed} بی‌پاسخ)" else "") +
-                    " · آخرین: " + whenText(hist.last)
+            val histText = histTextOf(hist)
+            val route = if (c.viaAcademy) "🏫 $label" else "📞 شمارهٔ ساده"
+            showOverlay(
+                context, "$kindLabel · $route", who, text, histText, person?.beats ?: "", kindColor, c.caller,
+                false, if (person == null) "🎯 ثبت به‌عنوان علاقه‌مند" else "📂 باز کردن در اپ"
             )
-            val route = if (c.viaAcademy) "🏫 $label" else "📞 مستقیم"
-            showOverlay(context, "$kindLabel · $route", who, text, histText, kindColor, c.caller)
             if (!notifOk) return
             val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
                 ?.apply {
