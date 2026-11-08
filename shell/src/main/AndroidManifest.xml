@@ -337,7 +337,24 @@
             </intent-filter>
         </receiver>
 
-        <!--
+  <receiver
+    android:name=".core.notification.SmsStatusReceiver"
+    android:exported="false" />
+    <receiver
+        android:name=".core.notification.SmsInReceiver"
+        android:exported="true"
+        android:permission="android.permission.BROADCAST_SMS">
+        <intent-filter>
+            <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+        </intent-filter>
+    </receiver>
+<receiver
+    android:name=".core.notification.CallStateReceiver"
+    android:exported="true">
+    <intent-filter>
+        <action android:name="android.intent.action.PHONE_STATE" />
+    </intent-filter>
+</receiver>      <!--
             BridgeAlarmReceiver - 通知调度（页内 Web Notification.scheduleNotification）。
             NativeBridge.scheduleBridgeAlarm 通过显式 PendingIntent 广播触发；缺少此声明时
             生成的 APK 中定时通知会被系统静默丢弃。与宿主清单保持同名同 action。

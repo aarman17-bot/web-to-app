@@ -912,6 +912,432 @@ await WtaDirectory.write('exports/image.png', pngBytes);
         false
     }
 
+    // ---- SMS send/delivery results (page: sendSmsTagged + getSmsDeliveryReports) ----------
+
+    /**
+     * Like [sendSms] but also asks Android for the send result and the carrier's delivery report.
+     * Returns "queued" (the real result comes later through [getSmsDeliveryReports]) or
+     * "no_permission" / "invalid" / "error".
+     */
+    @JavascriptInterface
+    fun sendSmsTagged(phone: String, body: String, tag: String): String =
+        com.webtoapp.core.notification.SmsSender.sendTagged(context, phone, body, tag)
+
+    /**
+     * JSON array: [{"tag","stage":"sent"|"delivered","status":"ok"|"failed"|"delivered","reason","at"}].
+     * Kept until [clearSmsDeliveryReports] is called, so results that arrive while the page is closed are not lost.
+     */
+    @JavascriptInterface
+    fun getSmsDeliveryReports(): String = try {
+        com.webtoapp.core.notification.SmsReports.read(context)
+    } catch (e: Exception) {
+        "[]"
+    }
+
+    @JavascriptInterface
+    fun clearSmsDeliveryReports(jsonTags: String): Boolean = try {
+        val arr = org.json.JSONArray(jsonTags)
+        val tags = (0 until arr.length()).map { arr.getString(it) }
+        com.webtoapp.core.notification.SmsReports.remove(context, tags)
+        true
+    } catch (e: Exception) {
+        false
+    }
+
+    // ---- Incoming-call monitor (caller-ID notification + missed-call SMS) -----------------
+
+    @JavascriptInterface
+    fun hasCallPerm(): Boolean = try {
+        com.webtoapp.core.notification.CallMonitor.hasPermissions(context)
+    } catch (e: Exception) {
+        false
+    }
+
+    /** Optional: lets the caller-ID show the name saved in the phone's contacts. */
+    @JavascriptInterface
+    fun hasContactsPerm(): Boolean = try {
+        ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+    } catch (e: Exception) {
+        false
+    }
+
+    /** Optional: lets the app show who sent an incoming SMS (only for numbers registered in the app). */
+    @JavascriptInterface
+    fun hasSmsReceivePerm(): Boolean = try {
+        com.webtoapp.core.notification.CallMonitor.hasSmsReceivePermission(context)
+    } catch (e: Exception) {
+        false
+    }
+
+    @JavascriptInterface
+    fun askCallPerm(): Boolean {
+        if (hasCallPerm() && hasContactsPerm() && hasSmsReceivePerm()) return true
+        val activity = context as? Activity ?: return false
+        scope.launch(Dispatchers.Main) {
+            try {
+                val perms = ArrayList<String>()
+                perms.add(android.Manifest.permission.READ_PHONE_STATE)
+                perms.add(android.Manifest.permission.READ_CALL_LOG)
+                perms.add(android.Manifest.permission.READ_CONTACTS)
+                perms.add(android.Manifest.permission.SEND_SMS)
+                perms.add(android.Manifest.permission.RECEIVE_SMS)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    perms.add(android.Manifest.permission.POST_NOTIFICATIONS)
+                }
+                ActivityCompat.requestPermissions(activity, perms.toTypedArray(), 9003)
+            } catch (e: Exception) {
+                AppLogger.w("NativeBridge", "Call-permission request failed", e)
+            }
+        }
+        return false
+    }
+
+    /** The page's call settings + student directory (JSON). Stored on the phone so it works while the page is closed. */
+    @JavascriptInterface
+    fun setCallConfig(json: String): Boolean =
+        com.webtoapp.core.notification.CallMonitor.setConfig(context, json)
+
+    /** JSON array of incoming-call events not yet cleared by the page. */
+    @JavascriptInterface
+    fun getCallEvents(): String = try {
+        com.webtoapp.core.notification.CallMonitor.readEvents(context)
+    } catch (e: Exception) {
+        "[]"
+    }
+
+    @JavascriptInterface
+    fun clearCallEvents(jsonIds: String): Boolean = try {
+        val arr = org.json.JSONArray(jsonIds)
+        val ids = (0 until arr.length()).map { arr.getString(it) }
+        com.webtoapp.core.notification.CallMonitor.clearEvents(context, ids)
+        true
+    } catch (e: Exception) {
+        false
+    }
+
+    /** Outgoing / answered-incoming calls since [sinceMs] (JSON) — lets the page close "missed call" cards that were called back. */
+    @JavascriptInterface
+    fun getCallbacksSince(sinceMs: String): String = try {
+        com.webtoapp.core.notification.CallMonitor.callbacksSince(context, sinceMs.toLongOrNull() ?: 0L)
+    } catch (e: Exception) {
+        "[]"
+    }
+
+    /** Health & number test: what the phone would do for [number] (JSON). Empty number = permissions/config status only. */
+    @JavascriptInterface
+    fun diagnoseCall(number: String): String = try {
+        com.webtoapp.core.notification.CallMonitor.diagnose(context, number)
+    } catch (e: Exception) {
+        "{}"
+    }
+
+    // ---- App features: launch actions, shortcuts, biometric, backups, file share ---------
+
+    /**
+     * What opened the app: a caller-ID notification tap (extra "wta_open_phone") or a
+     * launcher shortcut (extra "wta_action"). Returns JSON or "" and clears the extras so
+     * each launch is handled once.
+     */
+    @JavascriptInterface
+    fun getLaunchAction(): String = try {
+        val intent = (context as? Activity)?.intent
+        val phone = intent?.getStringExtra("wta_open_phone")
+        val action = intent?.getStringExtra("wta_action")
+        if (intent == null || (phone.isNullOrBlank() && action.isNullOrBlank())) {
+            ""
+        } else {
+            intent.removeExtra("wta_open_phone")
+            intent.removeExtra("wta_action")
+            org.json.JSONObject()
+                .put("action", if (!phone.isNullOrBlank()) "openStudent" else "shortcut")
+                .put("phone", phone ?: "")
+                .put("name", action ?: "")
+                .put("ts", System.currentTimeMillis())
+                .toString()
+        }
+    } catch (e: Exception) {
+        ""
+    }
+
+    /** Dynamic launcher shortcuts. [json] = [{"id","label","long"}]; an empty array removes them. */
+    @JavascriptInterface
+    fun setShortcuts(json: String): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N_MR1) return false
+        return try {
+            applyShortcuts(json)
+        } catch (e: Exception) {
+            AppLogger.w("NativeBridge", "setShortcuts failed", e)
+            false
+        }
+    }
+
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.N_MR1)
+    private fun applyShortcuts(json: String): Boolean {
+        val sm = context.getSystemService(android.content.pm.ShortcutManager::class.java) ?: return false
+        val arr = org.json.JSONArray(json)
+        if (arr.length() == 0) {
+            sm.removeAllDynamicShortcuts()
+            return true
+        }
+        val launchBase = context.packageManager.getLaunchIntentForPackage(context.packageName) ?: return false
+        val idRegex = Regex("^[a-z0-9_]{1,30}$")
+        val list = ArrayList<android.content.pm.ShortcutInfo>()
+        val max = minOf(arr.length(), sm.maxShortcutCountPerActivity, 4)
+        for (i in 0 until max) {
+            val o = arr.getJSONObject(i)
+            val id = o.optString("id")
+            if (!idRegex.matches(id)) continue
+            val label = o.optString("label").ifBlank { id }.take(25)
+            val intent = Intent(launchBase).apply {
+                action = Intent.ACTION_MAIN
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                putExtra("wta_action", id)
+            }
+            list.add(
+                android.content.pm.ShortcutInfo.Builder(context, "wta_$id")
+                    .setShortLabel(label)
+                    .setLongLabel(o.optString("long").ifBlank { label }.take(60))
+                    .setIcon(android.graphics.drawable.Icon.createWithResource(context, context.applicationInfo.icon))
+                    .setIntent(intent)
+                    .build()
+            )
+        }
+        sm.setDynamicShortcuts(list)
+        return true
+    }
+
+    // Biometric / phone screen-lock check (platform BiometricPrompt, no extra dependency).
+    // The page polls pollBiometric() because evaluateJavascript is dropped while the WebView is paused.
+    @Volatile private var bioResult: String = ""
+    @Volatile private var bioRequestId: String = ""
+
+    /** "ok" | "none_enrolled" | "unavailable" | "unsupported" */
+    @JavascriptInterface
+    fun biometricStatus(): String = try {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            "unsupported"
+        } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            "ok"
+        } else {
+            biometricStatusQ()
+        }
+    } catch (e: Exception) {
+        "unavailable"
+    }
+
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
+    private fun biometricStatusQ(): String {
+        val bm = context.getSystemService(android.hardware.biometrics.BiometricManager::class.java) ?: return "unavailable"
+        val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            bm.canAuthenticate(
+                android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_WEAK or
+                    android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            bm.canAuthenticate()
+        }
+        return when (code) {
+            android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS -> "ok"
+            android.hardware.biometrics.BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> "none_enrolled"
+            else -> "unavailable"
+        }
+    }
+
+    @JavascriptInterface
+    fun authBiometric(requestId: String, title: String, subtitle: String): Boolean {
+        bioRequestId = requestId
+        bioResult = "pending"
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            bioResult = "unsupported"
+            return false
+        }
+        val activity = context as? Activity
+        if (activity == null) {
+            bioResult = "unavailable"
+            return false
+        }
+        scope.launch(Dispatchers.Main) {
+            try {
+                startBiometricPrompt(activity, requestId, title, subtitle)
+            } catch (e: Exception) {
+                AppLogger.w("NativeBridge", "Biometric prompt failed", e)
+                if (bioRequestId == requestId) bioResult = "error"
+            }
+        }
+        return true
+    }
+
+    /** "pending" | "ok" | "cancel" | "error" | "unsupported" | "unavailable" | "unknown" */
+    @JavascriptInterface
+    fun pollBiometric(requestId: String): String = if (requestId == bioRequestId) bioResult else "unknown"
+
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.P)
+    private fun startBiometricPrompt(activity: Activity, requestId: String, title: String, subtitle: String) {
+        val executor = ContextCompat.getMainExecutor(activity)
+        val builder = android.hardware.biometrics.BiometricPrompt.Builder(activity)
+            .setTitle(title.ifBlank { "ورود" })
+        if (subtitle.isNotBlank()) builder.setSubtitle(subtitle)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.setAllowedAuthenticators(
+                android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_WEAK or
+                    android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+            )
+        } else {
+            builder.setNegativeButton("ورود با پین", executor) { _, _ ->
+                if (bioRequestId == requestId) bioResult = "cancel"
+            }
+        }
+        val prompt = builder.build()
+        prompt.authenticate(
+            android.os.CancellationSignal(),
+            executor,
+            object : android.hardware.biometrics.BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: android.hardware.biometrics.BiometricPrompt.AuthenticationResult?) {
+                    if (bioRequestId == requestId) bioResult = "ok"
+                }
+
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
+                    if (bioRequestId == requestId) bioResult = "cancel"
+                }
+            }
+        )
+    }
+
+    // Local backups (kept in the app's own folder; optionally mirrored to Download/AcademyBackup).
+    private val backupNameRegex = Regex("^[A-Za-z0-9._-]{3,80}\\.json$")
+
+    private fun backupDir(): java.io.File {
+        val base = context.getExternalFilesDir(null) ?: context.filesDir
+        return java.io.File(base, "AcademyBackups").also { it.mkdirs() }
+    }
+
+    /** Saves a backup file; keeps the newest 8. Returns the saved path or "" on failure. */
+    @JavascriptInterface
+    fun saveBackupFile(filename: String, content: String, alsoPublic: Boolean): String {
+        if (!backupNameRegex.matches(filename) || filename.contains("..")) return ""
+        return try {
+            val dir = backupDir()
+            val file = java.io.File(dir, filename)
+            file.writeText(content, Charsets.UTF_8)
+            dir.listFiles(java.io.FileFilter { it.isFile && it.name.endsWith(".json") })
+                ?.sortedByDescending { it.lastModified() }
+                ?.drop(8)
+                ?.forEach { it.delete() }
+            if (alsoPublic && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    insertPublicFile(filename, content.toByteArray(Charsets.UTF_8), "application/json", false, "Download/AcademyBackup")
+                } catch (e: Exception) {
+                    AppLogger.w("NativeBridge", "Public backup copy failed", e)
+                }
+            }
+            file.absolutePath
+        } catch (e: Exception) {
+            AppLogger.e("NativeBridge", "saveBackupFile failed", e)
+            ""
+        }
+    }
+
+    /** JSON array: [{"name","size","modified"}], newest first. */
+    @JavascriptInterface
+    fun listBackupFiles(): String = try {
+        val arr = org.json.JSONArray()
+        backupDir().listFiles(java.io.FileFilter { it.isFile && it.name.endsWith(".json") })
+            ?.sortedByDescending { it.lastModified() }
+            ?.forEach {
+                arr.put(
+                    org.json.JSONObject()
+                        .put("name", it.name)
+                        .put("size", it.length())
+                        .put("modified", it.lastModified())
+                )
+            }
+        arr.toString()
+    } catch (e: Exception) {
+        "[]"
+    }
+
+    @JavascriptInterface
+    fun readBackupFile(filename: String): String {
+        if (!backupNameRegex.matches(filename) || filename.contains("..")) return ""
+        return try {
+            val f = java.io.File(backupDir(), filename)
+            if (f.isFile) f.readText(Charsets.UTF_8) else ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
+    private fun insertPublicFile(
+        filename: String,
+        bytes: ByteArray,
+        mime: String,
+        image: Boolean,
+        relativePath: String
+    ): Uri? {
+        val values = android.content.ContentValues().apply {
+            put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, filename)
+            put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mime)
+            put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+        }
+        val collection = if (image) {
+            android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        } else {
+            android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        }
+        val uri = context.contentResolver.insert(collection, values) ?: return null
+        val out = context.contentResolver.openOutputStream(uri) ?: return null
+        out.use { it.write(bytes) }
+        return uri
+    }
+
+    /**
+     * Saves a file (e.g. a receipt PNG/PDF) and opens the system share sheet for it.
+     * Android 10+: stored through MediaStore (no extra permission). Older: saved to Downloads.
+     */
+    @JavascriptInterface
+    fun shareFileBase64(base64: String, filename: String, mimeType: String, title: String): Boolean {
+        if (!capabilities.openExternal) return false
+        if (!Regex("^[A-Za-z0-9._-]{1,80}$").matches(filename) || base64.length > 20_000_000) return false
+        scope.launch(Dispatchers.IO) {
+            try {
+                val bytes = Base64.decode(base64, Base64.DEFAULT)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val image = mimeType.startsWith("image/")
+                    val uri = insertPublicFile(
+                        filename, bytes, mimeType, image,
+                        if (image) "Pictures/AcademyReceipts" else "Download/AcademyReceipts"
+                    ) ?: throw IllegalStateException("MediaStore insert failed")
+                    withContext(Dispatchers.Main) { startShareChooser(uri, mimeType, title) }
+                } else if (capabilities.download) {
+                    downloadBridge.saveBase64File(base64, filename, mimeType)
+                } else {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, Strings.shareFailed, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (e: Exception) {
+                AppLogger.e("NativeBridge", "shareFileBase64 failed", e)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, Strings.shareFailed, Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        return true
+    }
+
+    private fun startShareChooser(uri: Uri, mimeType: String, title: String) {
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = mimeType
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, title)
+            clipData = ClipData.newRawUri(title, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(send, title).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+    }
+
     @JavascriptInterface
     fun requestNotificationPermission(): String {
         if (!capabilities.notification) return "denied"
