@@ -38,7 +38,8 @@ import java.util.TimeZone
  * Every call is classified into a scope:
  *  - "known"   : the real number is in the directory (student / registered in the app)
  *  - "academy" : not in the directory, but forwarded from the academy line (maybe a new student)
- *  - "direct"  : a non-registered number calling the manager's own phone -> completely ignored
+ *  - "contact" : not in the directory, no academy prefix, but saved in the phone contacts -> shown by name, no auto SMS
+ *  - "direct"  : a non-registered number that is not in the phone contacts -> completely ignored
  *                (no popup, no SMS, no contact lookup, nothing stored).
  * Incoming SMS is handled only for "known" numbers; everything else is ignored and never stored.
  */
@@ -56,7 +57,7 @@ object CallMonitor {
     private const val TAG = "CallMonitor"
 
     /** Shown in the app's "health & test" panel so you can see at a glance that the new APK is really installed. */
-    const val BUILD_TAG = "2026-11-08.3"
+    const val BUILD_TAG = "2026-11-08.6"
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -145,15 +146,28 @@ object CallMonitor {
     }
 
     /** "known" (registered in the app) / "academy" (forwarded from the academy line) / "direct" (ignored). */
-    private fun scopeOf(cfg: JSONObject, c: Caller): String {
+    private fun scopeOf(context: Context, cfg: JSONObject, c: Caller): String {
         val mobile = normalizeMobile(c.caller)
         if (mobile != null && lookup(cfg, mobile) != null) return "known"
-        return if (c.viaAcademy) "academy" else "direct"
+        if (c.viaAcademy) return "academy"
+        // Not registered and no academy prefix, but saved in the manager's phone contacts:
+        // the carrier sometimes delivers a forwarded call with the plain caller number.
+        if (mobile != null && contactName(context, mobile) != null) return "contact"
+        return "direct"
     }
 
     private class Person(val name: String, val info: String, val teacher: Boolean = false, val lead: Boolean = false)
 
-    /** Name saved for this number in the phone's own contacts (needs READ_CONTACTS; null when missing/not granted). */
+    private var nameCacheKey = ""
+    private var nameCacheVal: String? = null
+    private var nameCacheAt = 0L
+
+    /**
+     * Name saved for this number in the phone's own contacts (needs READ_CONTACTS; null when missing/not granted).
+     * Made robust against "works once, fails once": the system lookup is tried twice (the contacts provider can be
+     * cold when the receiver wakes the app), then every saved number is compared by its last 10 digits (handles
+     * spaces / odd formats), and a found name is remembered for a minute so the notification and the call record agree.
+     */
     private fun contactName(context: Context, mobile: String): String? {
         try {
             if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_CONTACTS)
@@ -161,6 +175,28 @@ object CallMonitor {
             ) return null
             val digits = mobile.filter { it.isDigit() }
             if (digits.length < 7) return null
+            val now = System.currentTimeMillis()
+            if (nameCacheKey == digits && nameCacheVal != null && now - nameCacheAt < 60_000L) return nameCacheVal
+            var found: String? = phoneLookupName(context, mobile, digits)
+            if (found == null) {
+                try { Thread.sleep(250) } catch (_: InterruptedException) {}
+                found = phoneLookupName(context, mobile, digits)
+            }
+            if (found == null) found = scanContactsByTail(context, digits)
+            if (found != null) {
+                nameCacheKey = digits
+                nameCacheVal = found
+                nameCacheAt = now
+            }
+            return found
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "contact lookup failed", e)
+        }
+        return null
+    }
+
+    private fun phoneLookupName(context: Context, mobile: String, digits: String): String? {
+        try {
             val variants = LinkedHashSet<String>()
             variants.add(mobile)
             if (digits.startsWith("09") && digits.length == 11) variants.add("+98" + digits.substring(1))
@@ -174,7 +210,30 @@ object CallMonitor {
                 }
             }
         } catch (e: Exception) {
-            AppLogger.w(TAG, "contact lookup failed", e)
+            AppLogger.w(TAG, "phone lookup failed", e)
+        }
+        return null
+    }
+
+    private fun scanContactsByTail(context: Context, digits: String): String? {
+        try {
+            val tail = digits.takeLast(10)
+            if (tail.length < 10) return null
+            context.contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME),
+                null, null, null
+            )?.use { cur ->
+                while (cur.moveToNext()) {
+                    val num = (cur.getString(0) ?: "").filter { it.isDigit() }
+                    if (num.length >= 10 && num.takeLast(10) == tail) {
+                        val n = cur.getString(1)
+                        if (!n.isNullOrBlank()) return n
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "contact scan failed", e)
         }
         return null
     }
@@ -238,12 +297,12 @@ object CallMonitor {
                 o.put("prefixes", JSONArray(academyPrefixes(cfg)))
                 if (raw.isNotBlank()) {
                     val c = parseCaller(raw, cfg)
-                    val scope = scopeOf(cfg, c)
+                    val scope = scopeOf(app, cfg, c)
                     val mobile = normalizeMobile(c.caller)
                     val person = if (mobile != null) lookup(cfg, mobile) else null
                     val ms = cfg.optJSONObject("missedSms")
                     val smsKind = when {
-                        scope == "direct" || person?.teacher == true || mobile == null -> "none"
+                        scope == "direct" || scope == "contact" || person?.teacher == true || mobile == null -> "none"
                         person != null && !person.lead -> "known"
                         else -> "unknown"
                     }
@@ -328,7 +387,13 @@ object CallMonitor {
                     at = now
                     p.edit().putLong("r_at", at).putLong("r_ans", 0L).putString("r_num", "").putBoolean("r_shown", false).apply()
                 }
-                val num = if (!number.isNullOrBlank()) number else (p.getString("r_num", "") ?: "")
+                val stored = p.getString("r_num", "") ?: ""
+                val num = when {
+                    number.isNullOrBlank() -> stored
+                    stored.isBlank() -> number
+                    normalizeMobile(parseCaller(stored, cfg).caller) != null -> stored // keep the first usable number of this ring
+                    else -> number
+                }
                 p.edit().putString("r_num", num).apply()
                 if (num.isNotBlank() && !p.getBoolean("r_shown", false) && cfg.optBoolean("popup", false)) {
                     showCallerNotification(app, cfg, num)
@@ -353,10 +418,10 @@ object CallMonitor {
     private fun finishCall(context: Context, cfg: JSONObject, rawNumber: String, answeredAt: Long, now: Long) {
         if (rawNumber.isBlank()) return // no READ_CALL_LOG: the system hides the number
         val c = parseCaller(rawNumber, cfg)
-        val scope = scopeOf(cfg, c)
+        val scope = scopeOf(context, cfg, c)
         if (scope == "direct") { bumpIgnored(context, "ign_calls"); return } // a non-registered number calling the manager's own phone: not our business
         val answered = answeredAt > 0L
-        val contact = if (scope == "academy") contactName(context, c.caller) else null
+        val contact = if (scope == "academy" || scope == "contact") contactName(context, c.caller) else null
         val ev = JSONObject()
             .put("id", "c" + now + (1000..9999).random())
             .put("kind", "call")
@@ -371,7 +436,7 @@ object CallMonitor {
             .put("durationSec", if (answered) ((now - answeredAt) / 1000L) else 0L)
             .put("smsState", "none")
             .put("smsPending", false)
-        if (!answered) {
+        if (!answered && scope != "contact") { // no automatic SMS to people who are only in the phone contacts
             try { maybeSendMissedSms(context, cfg, c, ev) } catch (e: Exception) { AppLogger.e(TAG, "missed SMS failed", e) }
         }
         addEvent(context, ev)
@@ -398,7 +463,7 @@ object CallMonitor {
                 != PackageManager.PERMISSION_GRANTED
             ) return
             val c = parseCaller(raw, cfg)
-            if (scopeOf(cfg, c) == "direct") return // not a student / not from the academy line
+            if (scopeOf(context, cfg, c) == "direct") return // not a student / not from the academy line
             ensureChannel(context)
             val person = lookup(cfg, c.caller)
             val label = cfg.optJSONObject("academy")?.optString("label", "آکادمی") ?: "آکادمی"
@@ -408,10 +473,10 @@ object CallMonitor {
                 contact != null -> contact
                 else -> c.caller
             }
-            val title = (if (c.viaAcademy) "🏫 $label — " else "📞 ") + who
+            val title = (if (c.viaAcademy) "🏫 $label — " else "📞 مستقیم — ") + who
             val text = when {
                 person != null && person.info.isNotBlank() -> person.info
-                contact != null -> "مخاطبِ گوشی — شاگردِ ثبت‌شده نیست"
+                contact != null -> if (c.viaAcademy) "مخاطبِ گوشی — تماس به خطِ آکادمی (دایورت)" else "مخاطبِ گوشی — تماس مستقیم به خطِ شما"
                 person == null -> "شمارهٔ ناشناس"
                 else -> c.caller
             }
