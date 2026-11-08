@@ -57,7 +57,7 @@ object CallMonitor {
     private const val TAG = "CallMonitor"
 
     /** Shown in the app's "health & test" panel so you can see at a glance that the new APK is really installed. */
-    const val BUILD_TAG = "2026-11-08.6"
+    const val BUILD_TAG = "2026-11-08.8"
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -292,6 +292,7 @@ object CallMonitor {
                     .put("contacts", ContextCompat.checkSelfPermission(app, android.Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED)
                     .put("smsIn", hasSmsReceivePermission(app))
                     .put("notif", notificationsAllowed(app))
+                    .put("overlay", canShowOverlay(app))
             )
             if (cfg != null) {
                 o.put("prefixes", JSONArray(academyPrefixes(cfg)))
@@ -442,6 +443,194 @@ object CallMonitor {
         addEvent(context, ev)
     }
 
+    // ---- on-screen caller card (drawn over the phone's own call screen) -------------
+
+    private var overlayView: android.view.View? = null
+    private val overlayHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
+    private val overlayAutoHide = Runnable { removeOverlayNow() }
+    private var overlayCtx: Context? = null
+
+    /** True when the user allowed "Appear on top" (Settings > Apps > this app) for the app. */
+    fun canShowOverlay(context: Context): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.M || android.provider.Settings.canDrawOverlays(context)
+
+    private fun removeOverlayNow() {
+        try {
+            val v = overlayView ?: return
+            val app = overlayCtx ?: return
+            val wm = app.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+            wm.removeView(v)
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "overlay remove failed", e)
+        } finally {
+            overlayView = null
+            overlayHandler.removeCallbacks(overlayAutoHide)
+        }
+    }
+
+    private fun hideOverlay() {
+        overlayHandler.post { removeOverlayNow() }
+    }
+
+    private class CallHistory(val total: Int, val missed: Int, val last: Long)
+
+    /** Earlier incoming calls from this caller, read from the phone's call log (forwarded "+9821…" numbers are unwrapped). */
+    private fun callHistory(context: Context, cfg: JSONObject, mobile: String): CallHistory {
+        var total = 0
+        var missed = 0
+        var last = 0L
+        try {
+            if (!hasPermissions(context)) return CallHistory(0, 0, 0L)
+            context.contentResolver.query(
+                CallLog.Calls.CONTENT_URI,
+                arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.DATE),
+                null, null, CallLog.Calls.DATE + " DESC"
+            )?.use { cur ->
+                var rows = 0
+                while (cur.moveToNext() && rows < 1000) {
+                    rows++
+                    val type = cur.getInt(1)
+                    if (type != CallLog.Calls.INCOMING_TYPE && type != CallLog.Calls.MISSED_TYPE &&
+                        type != CallLog.Calls.REJECTED_TYPE
+                    ) continue
+                    val num = cur.getString(0) ?: continue
+                    if (parseCaller(num, cfg).caller != mobile) continue
+                    total++
+                    if (type != CallLog.Calls.INCOMING_TYPE) missed++
+                    val ts = cur.getLong(2)
+                    if (ts > last) last = ts
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "call history failed", e)
+        }
+        return CallHistory(total, missed, last)
+    }
+
+    private fun faDigits(s: String): String {
+        val map = "۰۱۲۳۴۵۶۷۸۹"
+        val sb = StringBuilder()
+        for (ch in s) sb.append(if (ch in '0'..'9') map[ch - '0'] else ch)
+        return sb.toString()
+    }
+
+    private fun dayStart(ms: Long): Long {
+        val cal = Calendar.getInstance()
+        cal.timeInMillis = ms
+        cal.set(Calendar.HOUR_OF_DAY, 0)
+        cal.set(Calendar.MINUTE, 0)
+        cal.set(Calendar.SECOND, 0)
+        cal.set(Calendar.MILLISECOND, 0)
+        return cal.timeInMillis
+    }
+
+    private fun whenText(ts: Long): String {
+        val days = Math.round((dayStart(System.currentTimeMillis()) - dayStart(ts)) / 86_400_000.0).toInt()
+        val hm = SimpleDateFormat("HH:mm", Locale.US).format(Date(ts))
+        return when {
+            days <= 0 -> "امروز $hm"
+            days == 1 -> "دیروز $hm"
+            else -> "$days روز پیش"
+        }
+    }
+
+    private fun showOverlay(
+        context: Context, header: String, name: String, info: String,
+        history: String, color: Int, phone: String
+    ) {
+        try {
+            if (!canShowOverlay(context)) return
+            val app = context.applicationContext
+            overlayHandler.post {
+                try {
+                    removeOverlayNow()
+                    overlayCtx = app
+                    val d = app.resources.displayMetrics.density
+                    val box = android.widget.LinearLayout(app)
+                    box.orientation = android.widget.LinearLayout.VERTICAL
+                    val pad = (14 * d).toInt()
+                    box.setPadding(pad, pad, pad, pad)
+                    val bg = android.graphics.drawable.GradientDrawable()
+                    bg.setColor(color)
+                    bg.cornerRadius = 18 * d
+                    box.background = bg
+
+                    fun line(txt: String, sizeSp: Float, argb: Int, bold: Boolean) {
+                        if (txt.isBlank()) return
+                        val tv = android.widget.TextView(app)
+                        tv.text = txt
+                        tv.setTextColor(argb)
+                        tv.textSize = sizeSp
+                        if (bold) tv.setTypeface(tv.typeface, android.graphics.Typeface.BOLD)
+                        tv.gravity = android.view.Gravity.CENTER
+                        box.addView(tv)
+                    }
+                    line(header, 13f, 0xFFE8EAED.toInt(), false)
+                    line(name, 22f, 0xFFFFFFFF.toInt(), true)
+                    line(info, 14f, 0xFFFFFFFF.toInt(), false)
+                    line(history, 13f, 0xFFE8EAED.toInt(), false)
+
+                    val launch = app.packageManager.getLaunchIntentForPackage(app.packageName)?.apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                        // Same extra as the notification: the page opens the caller's student page.
+                        if (phone.isNotBlank()) putExtra("wta_open_phone", phone)
+                    }
+                    if (launch != null) {
+                        val btn = android.widget.TextView(app)
+                        btn.text = "📂 باز کردن در اپ"
+                        btn.setTextColor(0xFFFFFFFF.toInt())
+                        btn.textSize = 14f
+                        btn.setTypeface(btn.typeface, android.graphics.Typeface.BOLD)
+                        btn.gravity = android.view.Gravity.CENTER
+                        val bb = android.graphics.drawable.GradientDrawable()
+                        bb.setColor(0x33FFFFFF)
+                        bb.cornerRadius = 12 * d
+                        btn.background = bb
+                        val bp = (8 * d).toInt()
+                        btn.setPadding(bp * 2, bp, bp * 2, bp)
+                        val blp = android.widget.LinearLayout.LayoutParams(
+                            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                        )
+                        blp.topMargin = (10 * d).toInt()
+                        btn.layoutParams = blp
+                        btn.setOnClickListener {
+                            try { app.startActivity(launch) } catch (e: Exception) { AppLogger.w(TAG, "overlay open failed", e) }
+                            removeOverlayNow()
+                        }
+                        box.addView(btn)
+                    }
+
+                    val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                        android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                    else
+                        @Suppress("DEPRECATION") android.view.WindowManager.LayoutParams.TYPE_PHONE
+                    val lp = android.view.WindowManager.LayoutParams(
+                        app.resources.displayMetrics.widthPixels - (32 * d).toInt(),
+                        android.view.WindowManager.LayoutParams.WRAP_CONTENT,
+                        type,
+                        // touchable (for the open button) but never focusable, so the call screen keeps working
+                        android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                            android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                            android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        android.graphics.PixelFormat.TRANSLUCENT
+                    )
+                    lp.gravity = android.view.Gravity.TOP or android.view.Gravity.CENTER_HORIZONTAL
+                    lp.y = (56 * d).toInt()
+
+                    val wm = app.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+                    wm.addView(box, lp)
+                    overlayView = box
+                    overlayHandler.postDelayed(overlayAutoHide, 90_000L)
+                } catch (e: Exception) {
+                    AppLogger.w(TAG, "overlay show failed", e)
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "overlay failed", e)
+        }
+    }
+
     // ---- caller-ID notification ---------------------------------------------
 
     private fun ensureChannel(context: Context) {
@@ -458,10 +647,9 @@ object CallMonitor {
 
     private fun showCallerNotification(context: Context, cfg: JSONObject, raw: String) {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            val notifOk = !(Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                 ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) return
+                != PackageManager.PERMISSION_GRANTED)
             val c = parseCaller(raw, cfg)
             if (scopeOf(context, cfg, c) == "direct") return // not a student / not from the academy line
             ensureChannel(context)
@@ -480,6 +668,29 @@ object CallMonitor {
                 person == null -> "شمارهٔ ناشناس"
                 else -> c.caller
             }
+            // on-screen card above the phone's call screen (needs "Appear on top")
+            val kindLabel = when {
+                person?.teacher == true -> "👨‍🏫 مدرس"
+                person?.lead == true -> "🎯 علاقه‌مند"
+                person != null -> "🎓 شاگرد"
+                contact != null -> "📇 مخاطبِ گوشی"
+                else -> "❓ ناشناس"
+            }
+            val kindColor = when {
+                person?.teacher == true -> 0xF21565C0.toInt()
+                person?.lead == true -> 0xF2E65100.toInt()
+                person != null -> 0xF22E7D32.toInt()
+                contact != null -> 0xF2455A64.toInt()
+                else -> 0xF2424242.toInt()
+            }
+            val hist = callHistory(context, cfg, c.caller)
+            val histText = if (hist.total == 0) "اولین تماس ثبت‌شده" else faDigits(
+                "تماس‌های قبلی: ${hist.total}" + (if (hist.missed > 0) " (${hist.missed} بی‌پاسخ)" else "") +
+                    " · آخرین: " + whenText(hist.last)
+            )
+            val route = if (c.viaAcademy) "🏫 $label" else "📞 مستقیم"
+            showOverlay(context, "$kindLabel · $route", who, text, histText, kindColor, c.caller)
+            if (!notifOk) return
             val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
                 ?.apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -508,6 +719,7 @@ object CallMonitor {
 
     private fun cancelNotification(context: Context) {
         try { NotificationManagerCompat.from(context).cancel(NOTIF_ID) } catch (_: Exception) {}
+        hideOverlay()
     }
 
     // ---- missed-call SMS -----------------------------------------------------
