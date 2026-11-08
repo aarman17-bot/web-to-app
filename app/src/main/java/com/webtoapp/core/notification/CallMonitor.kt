@@ -9,7 +9,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.provider.CallLog
 import android.provider.ContactsContract
+import android.provider.Telephony
 import android.telephony.TelephonyManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -24,12 +26,21 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
- * Incoming-call helper driven by the page (see NativeBridge.setCallConfig):
+ * Incoming-call / incoming-SMS helper driven by the page (see NativeBridge.setCallConfig):
  *  - shows a caller-ID notification (name + info from the student directory) while the phone rings,
  *  - sends a "missed call" SMS (known / unknown number, after-hours text, quiet hours, cooldown),
- *  - keeps a list of call events that the page reads with getCallEvents().
- * Calls forwarded from the academy line arrive as "<prefix>98<mobile without 0>"
- * (e.g. +9821 98 9381002449); the real caller is the part after the prefix.
+ *  - shows a sender-ID notification when an SMS arrives from a registered number (student / teacher),
+ *  - keeps a list of call / SMS events that the page reads with getCallEvents().
+ *
+ * Calls forwarded from the academy line arrive as "<prefix>[98]<mobile>"
+ * (e.g. +9821 98 9381002449 or +9821 9038112389); the real caller is the part after the prefix.
+ *
+ * Every call is classified into a scope:
+ *  - "known"   : the real number is in the directory (student / registered in the app)
+ *  - "academy" : not in the directory, but forwarded from the academy line (maybe a new student)
+ *  - "direct"  : a non-registered number calling the manager's own phone -> completely ignored
+ *                (no popup, no SMS, no contact lookup, nothing stored).
+ * Incoming SMS is handled only for "known" numbers; everything else is ignored and never stored.
  */
 object CallMonitor {
     private const val PREFS = "bridge_call"
@@ -37,9 +48,15 @@ object CallMonitor {
     private const val KEY_EVENTS = "events"
     private const val CHANNEL_ID = "call_caller_id"
     private const val NOTIF_ID = 7710
+    private const val SMS_CHANNEL_ID = "sms_sender_id"
+    private const val SMS_NOTIF_ID = 7711
+    private const val SMS_PREVIEW_MAX = 160
     private const val MAX_EVENTS = 200
     private const val SMS_WAIT_MS = 90_000L
     private const val TAG = "CallMonitor"
+
+    /** Shown in the app's "health & test" panel so you can see at a glance that the new APK is really installed. */
+    const val BUILD_TAG = "2026-11-08.3"
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -93,23 +110,48 @@ object CallMonitor {
 
     private class Caller(val raw: String, val caller: String, val viaAcademy: Boolean)
 
+    /**
+     * Academy-line prefixes from the config. Entries are separated by comma / ، / ; only
+     * (spaces stay INSIDE an entry, so "+9821 98" is one prefix). A prefix that ends with "98"
+     * (people copy the example "+9821 98 9381002449") is also tried without that "98", because
+     * the forwarded number is sometimes "<prefix>98<mobile>" and sometimes just "<prefix><mobile>".
+     * Prefixes shorter than 3 digits are ignored: "98" alone would match every Iranian mobile.
+     */
+    private fun academyPrefixes(cfg: JSONObject): List<String> {
+        val academy = cfg.optJSONObject("academy") ?: return emptyList()
+        if (!academy.optBoolean("on", false)) return emptyList()
+        val arr = academy.optJSONArray("prefixes") ?: return emptyList()
+        val out = LinkedHashSet<String>()
+        for (i in 0 until arr.length()) {
+            for (part in arr.optString(i).split(Regex("[,،;]+"))) {
+                val p = part.filter { it.isDigit() }
+                if (p.length < 3) continue
+                out.add(p)
+                if (p.length > 4 && p.endsWith("98")) out.add(p.dropLast(2))
+            }
+        }
+        return out.toList()
+    }
+
     private fun parseCaller(raw: String, cfg: JSONObject): Caller {
         val digits = raw.filter { it.isDigit() }
-        val academy = cfg.optJSONObject("academy")
-        if (academy != null && academy.optBoolean("on", false)) {
-            val arr = academy.optJSONArray("prefixes") ?: JSONArray()
-            for (i in 0 until arr.length()) {
-                val p = arr.optString(i).filter { it.isDigit() }
-                if (p.isNotEmpty() && digits.startsWith(p)) {
-                    val rest = normalizeMobile(digits.substring(p.length))
-                    if (rest != null) return Caller(raw, rest, true)
-                }
+        for (p in academyPrefixes(cfg)) {
+            if (digits.startsWith(p)) {
+                val rest = normalizeMobile(digits.substring(p.length))
+                if (rest != null) return Caller(raw, rest, true)
             }
         }
         return Caller(raw, normalizeMobile(digits) ?: raw, false)
     }
 
-    private class Person(val name: String, val info: String)
+    /** "known" (registered in the app) / "academy" (forwarded from the academy line) / "direct" (ignored). */
+    private fun scopeOf(cfg: JSONObject, c: Caller): String {
+        val mobile = normalizeMobile(c.caller)
+        if (mobile != null && lookup(cfg, mobile) != null) return "known"
+        return if (c.viaAcademy) "academy" else "direct"
+    }
+
+    private class Person(val name: String, val info: String, val teacher: Boolean = false, val lead: Boolean = false)
 
     /** Name saved for this number in the phone's own contacts (needs READ_CONTACTS; null when missing/not granted). */
     private fun contactName(context: Context, mobile: String): String? {
@@ -141,9 +183,133 @@ object CallMonitor {
         val dir = cfg.optJSONArray("directory") ?: return null
         for (i in 0 until dir.length()) {
             val o = dir.optJSONObject(i) ?: continue
-            if (o.optString("p") == mobile) return Person(o.optString("n"), o.optString("i"))
+            if (o.optString("p") == mobile) return Person(o.optString("n"), o.optString("i"), o.optInt("t", 0) == 1, o.optInt("l", 0) == 1)
         }
         return null
+    }
+
+    // ---- diagnostics (health & number test panel in the app) ---------------------
+
+    /** Counts only (never numbers / texts) of calls & SMS ignored today because the sender is not registered. */
+    private fun bumpIgnored(context: Context, key: String) {
+        try {
+            val p = prefs(context)
+            val day = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+            val e = p.edit()
+            if (p.getString("ign_day", "") != day) e.putString("ign_day", day).putInt("ign_calls", 0).putInt("ign_sms", 0)
+            e.apply()
+            p.edit().putInt(key, p.getInt(key, 0) + 1).apply()
+        } catch (_: Exception) {}
+    }
+
+    fun notificationsAllowed(context: Context): Boolean {
+        val permOk = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        return permOk && NotificationManagerCompat.from(context).areNotificationsEnabled()
+    }
+
+    /**
+     * What the phone would do for [raw] (a number as it appears in the call log, e.g. +98219038112389),
+     * using the SAME code and the SAME stored config as a real call. Empty [raw] = status only.
+     */
+    fun diagnose(context: Context, raw: String): String {
+        val o = JSONObject()
+        try {
+            val app = context.applicationContext
+            val cfg = config(app)
+            val p = prefs(app)
+            val today = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+            val sameDay = p.getString("ign_day", "") == today
+            o.put("build", BUILD_TAG)
+            o.put("hasConfig", cfg != null)
+            o.put("monitor", cfg?.optBoolean("monitor", false) ?: false)
+            o.put("directorySize", cfg?.optJSONArray("directory")?.length() ?: 0)
+            o.put("ignoredCallsToday", if (sameDay) p.getInt("ign_calls", 0) else 0)
+            o.put("ignoredSmsToday", if (sameDay) p.getInt("ign_sms", 0) else 0)
+            o.put(
+                "perm",
+                JSONObject()
+                    .put("call", hasPermissions(app))
+                    .put("contacts", ContextCompat.checkSelfPermission(app, android.Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED)
+                    .put("smsIn", hasSmsReceivePermission(app))
+                    .put("notif", notificationsAllowed(app))
+            )
+            if (cfg != null) {
+                o.put("prefixes", JSONArray(academyPrefixes(cfg)))
+                if (raw.isNotBlank()) {
+                    val c = parseCaller(raw, cfg)
+                    val scope = scopeOf(cfg, c)
+                    val mobile = normalizeMobile(c.caller)
+                    val person = if (mobile != null) lookup(cfg, mobile) else null
+                    val ms = cfg.optJSONObject("missedSms")
+                    val smsKind = when {
+                        scope == "direct" || person?.teacher == true || mobile == null -> "none"
+                        person != null && !person.lead -> "known"
+                        else -> "unknown"
+                    }
+                    o.put("caller", c.caller)
+                    o.put("via", c.viaAcademy)
+                    o.put("scope", scope)
+                    o.put("person", person?.name ?: "")
+                    o.put("lead", person?.lead ?: false)
+                    o.put("contact", contactName(app, c.caller) ?: "")
+                    o.put("popup", scope != "direct" && cfg.optBoolean("popup", false))
+                    o.put("smsKind", smsKind)
+                    o.put(
+                        "smsEnabled",
+                        ms != null && when (smsKind) {
+                            "known" -> ms.optBoolean("known", false)
+                            "unknown" -> ms.optBoolean("unknown", false)
+                            else -> false
+                        }
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "diagnose failed", e)
+        }
+        return o.toString()
+    }
+
+    /**
+     * Calls made AFTER a missed call: outgoing calls (any duration) and answered incoming calls since [sinceMs].
+     * The page uses it to close "missed call" cards automatically. Result: [{"n":"09…","t":ms,"d":"out"|"in"}].
+     */
+    fun callbacksSince(context: Context, sinceMs: Long): String {
+        val out = JSONArray()
+        try {
+            if (!hasPermissions(context)) return "[]"
+            val app = context.applicationContext
+            val cfg = config(app)
+            val since = sinceMs.coerceAtLeast(System.currentTimeMillis() - 3L * 24 * 3600 * 1000)
+            app.contentResolver.query(
+                CallLog.Calls.CONTENT_URI,
+                arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.DATE, CallLog.Calls.DURATION),
+                CallLog.Calls.DATE + " >= ?",
+                arrayOf(since.toString()),
+                CallLog.Calls.DATE + " DESC"
+            )?.use { cur ->
+                var rows = 0
+                while (cur.moveToNext() && rows < 500) {
+                    rows++
+                    val num = cur.getString(0) ?: continue
+                    val type = cur.getInt(1)
+                    val date = cur.getLong(2)
+                    val dur = cur.getLong(3)
+                    val dir = when {
+                        type == CallLog.Calls.OUTGOING_TYPE -> "out"
+                        type == CallLog.Calls.INCOMING_TYPE && dur > 0L -> "in"
+                        else -> continue
+                    }
+                    val real = if (cfg != null) parseCaller(num, cfg).caller else num
+                    val mobile = normalizeMobile(real) ?: continue
+                    out.put(JSONObject().put("n", mobile).put("t", date).put("d", dir))
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "callbacksSince failed", e)
+        }
+        return out.toString()
     }
 
     // ---- phone state -------------------------------------------------------
@@ -187,10 +353,14 @@ object CallMonitor {
     private fun finishCall(context: Context, cfg: JSONObject, rawNumber: String, answeredAt: Long, now: Long) {
         if (rawNumber.isBlank()) return // no READ_CALL_LOG: the system hides the number
         val c = parseCaller(rawNumber, cfg)
+        val scope = scopeOf(cfg, c)
+        if (scope == "direct") { bumpIgnored(context, "ign_calls"); return } // a non-registered number calling the manager's own phone: not our business
         val answered = answeredAt > 0L
-        val contact = contactName(context, c.caller)
+        val contact = if (scope == "academy") contactName(context, c.caller) else null
         val ev = JSONObject()
             .put("id", "c" + now + (1000..9999).random())
+            .put("kind", "call")
+            .put("scope", scope)
             .put("ts", now)
             .put("number", rawNumber)
             .put("caller", c.caller)
@@ -227,8 +397,9 @@ object CallMonitor {
                 ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED
             ) return
-            ensureChannel(context)
             val c = parseCaller(raw, cfg)
+            if (scopeOf(cfg, c) == "direct") return // not a student / not from the academy line
+            ensureChannel(context)
             val person = lookup(cfg, c.caller)
             val label = cfg.optJSONObject("academy")?.optString("label", "آکادمی") ?: "آکادمی"
             val contact = if (person == null) contactName(context, c.caller) else null
@@ -245,7 +416,11 @@ object CallMonitor {
                 else -> c.caller
             }
             val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
-                ?.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP) }
+                ?.apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    // The page reads this (NativeBridge.getLaunchAction) to open the caller's student page.
+                    if (c.caller.isNotBlank()) putExtra("wta_open_phone", c.caller)
+                }
             val pi = if (launch != null) PendingIntent.getActivity(
                 context, NOTIF_ID, launch, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             ) else null
@@ -285,7 +460,8 @@ object CallMonitor {
         val ms = cfg.optJSONObject("missedSms") ?: return
         val mobile = normalizeMobile(c.caller) ?: return // a landline / foreign number cannot get this SMS
         val person = lookup(cfg, mobile)
-        val known = person != null
+        if (person?.teacher == true) return // the "missed call" texts are written for students, not teachers
+        val known = person != null && !person.lead // a "lead" (interested caller, not yet a student) gets the generic text
         if (known && !ms.optBoolean("known", false)) return
         if (!known && !ms.optBoolean("unknown", false)) return
 
@@ -347,6 +523,102 @@ object CallMonitor {
             prefs(context).edit().putString(KEY_EVENTS, arr.toString()).apply()
         } catch (e: Exception) {
             AppLogger.e(TAG, "onSmsSent failed", e)
+        }
+    }
+
+    // ---- incoming SMS (sender-ID) ---------------------------------------------------
+
+    private fun ensureSmsChannel(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        if (nm.getNotificationChannel(SMS_CHANNEL_ID) != null) return
+        val ch = NotificationChannel(SMS_CHANNEL_ID, "شناسایی فرستندهٔ پیامک", NotificationManager.IMPORTANCE_DEFAULT).apply {
+            description = "نمایش نام شاگرد هنگام رسیدن پیامک از شمارهٔ ثبت‌شده"
+            setSound(null, null) // the SMS app already makes the sound; this one only adds the name
+            enableVibration(false)
+        }
+        nm.createNotificationChannel(ch)
+    }
+
+    fun hasSmsReceivePermission(context: Context): Boolean =
+        ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
+
+    /**
+     * Called by [SmsInReceiver]. Works ONLY for numbers registered in the app (the directory sent by the page):
+     * anything else (friends, family, banks, short codes, alphanumeric senders) is ignored — no notification,
+     * no event, and the text is never stored.
+     */
+    @Synchronized
+    fun onIncomingSms(context: Context, sender: String?, body: String?) {
+        try {
+            val app = context.applicationContext
+            val cfg = config(app) ?: return
+            if (!cfg.optBoolean("monitor", false)) return
+            val si = cfg.optJSONObject("smsIn") ?: return
+            if (!si.optBoolean("on", false)) return
+            val mobile = normalizeMobile(sender ?: return)
+            if (mobile == null) { bumpIgnored(app, "ign_sms"); return }
+            val person = lookup(cfg, mobile)
+            if (person == null) { bumpIgnored(app, "ign_sms"); return }
+            val now = System.currentTimeMillis()
+            val showText = si.optBoolean("preview", true)
+            val preview = if (showText) (body ?: "").trim().replace(Regex("\\s+"), " ").take(SMS_PREVIEW_MAX) else ""
+            showSmsNotification(app, person, mobile, preview)
+            addEvent(
+                app,
+                JSONObject()
+                    .put("id", "s" + now + (1000..9999).random())
+                    .put("kind", "sms")
+                    .put("scope", "known")
+                    .put("ts", now)
+                    .put("number", sender)
+                    .put("caller", mobile)
+                    .put("viaAcademy", false)
+                    .put("contact", "")
+                    .put("state", "received")
+                    .put("at", iso(now))
+                    .put("durationSec", 0)
+                    .put("text", preview)
+                    .put("smsState", "none")
+                    .put("smsPending", false)
+            )
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "incoming SMS handling failed", e)
+        }
+    }
+
+    private fun showSmsNotification(context: Context, person: Person, mobile: String, preview: String) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) return
+            ensureSmsChannel(context)
+            val title = "💬 " + person.name.ifBlank { mobile }
+            val text = if (preview.isNotBlank()) preview else "پیامک جدید"
+            val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                ?.apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    putExtra("wta_open_phone", mobile) // same hook as the caller-ID tap: opens the student's page
+                }
+            val pi = if (launch != null) PendingIntent.getActivity(
+                context, mobile.hashCode(), launch, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            ) else null
+            val b = NotificationCompat.Builder(context, SMS_CHANNEL_ID)
+                .setSmallIcon(context.applicationInfo.icon)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setAutoCancel(true)
+            if (person.info.isNotBlank()) b.setSubText(person.info)
+            if (pi != null) b.setContentIntent(pi)
+            // tag = number: a second SMS from the same person replaces the first instead of stacking
+            NotificationManagerCompat.from(context).notify(mobile, SMS_NOTIF_ID, b.build())
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "sms notification failed", e)
         }
     }
 
@@ -419,6 +691,22 @@ class CallStateReceiver : BroadcastReceiver() {
             AppLogger.e("CallStateReceiver", "onReceive failed", e)
         } finally {
             try { pending.finish() } catch (_: Exception) {}
+        }
+    }
+}
+
+/** Registered in the manifest for android.provider.Telephony.SMS_RECEIVED (needs RECEIVE_SMS). */
+class SmsInReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
+        try {
+            val msgs = Telephony.Sms.Intents.getMessagesFromIntent(intent) ?: return
+            if (msgs.isEmpty()) return
+            val sender = msgs[0].originatingAddress
+            val body = msgs.joinToString("") { it.messageBody ?: "" } // multipart SMS arrive as several parts
+            CallMonitor.onIncomingSms(context, sender, body)
+        } catch (e: Exception) {
+            AppLogger.e("SmsInReceiver", "onReceive failed", e)
         }
     }
 }
