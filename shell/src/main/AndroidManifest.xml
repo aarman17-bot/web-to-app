@@ -340,7 +340,14 @@
   <receiver
     android:name=".core.notification.SmsStatusReceiver"
     android:exported="false" />
-
+    <receiver
+        android:name=".core.notification.SmsInReceiver"
+        android:exported="true"
+        android:permission="android.permission.BROADCAST_SMS">
+        <intent-filter>
+            <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+        </intent-filter>
+    </receiver>
 <receiver
     android:name=".core.notification.CallStateReceiver"
     android:exported="true">
