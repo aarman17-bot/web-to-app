@@ -13,7 +13,9 @@ class AppStringsResourceConsistencyTest {
         // translatable="false" — anything user-visible belongs in core/i18n/.
         val NON_LOCALIZED_STRING_KEYS = setOf(
 
-            "app_name",
+                "app_name",
+            "wa_auto_service_label",
+            "wa_auto_service_desc"
         )
 
         // values-<lang>, values-<lang>-r<region>, values-b+<lang>… but NOT
