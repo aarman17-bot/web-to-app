@@ -3980,8 +3980,12 @@ builtins.__import__ = _w2a_import
             }
         }
 
-        if (config.enableNativeBridge && config.webViewBehavior.nativeBridgeNotificationScheduled) {
+                if (config.enableNativeBridge && config.webViewBehavior.nativeBridgeNotificationScheduled) {
             components += "com.webtoapp.core.notification.BridgeAlarmReceiver"
+        }
+
+        if (config.enableNativeBridge) {
+            components += "com.webtoapp.core.notification.WhatsAppAutoService"
         }
 
         if (config.floatingWindowEnabled) {
