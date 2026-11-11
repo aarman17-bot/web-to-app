@@ -157,6 +157,7 @@ class AxmlRebuilder {
             "com.webtoapp.core.port.PortQueryReceiver",
             "com.webtoapp.core.port.PortReleaseReceiver",
             "com.webtoapp.core.notification.BridgeAlarmReceiver",
+            "com.webtoapp.core.notification.WhatsAppAutoService",
             "androidx.core.content.FileProvider"
         )
 
