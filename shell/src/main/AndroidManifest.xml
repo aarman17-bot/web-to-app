@@ -164,7 +164,10 @@
     事件，子 APK 在 webapp 内滑边返回会回退网页历史，而不是退到桌面。
     ==========================================================================
     -->
-    <application
+   <queries>
+    <package android:name="com.whatsapp" />
+    <package android:name="com.whatsapp.w4b" />
+</queries> <application
         android:name=".WebToAppApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
@@ -361,6 +364,17 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
-    </application>
+   <service
+    android:name=".core.notification.WhatsAppAutoService"
+    android:exported="false"
+    android:label="@string/wa_auto_service_label"
+    android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+    <intent-filter>
+        <action android:name="android.accessibilityservice.AccessibilityService" />
+    </intent-filter>
+    <meta-data
+        android:name="android.accessibilityservice"
+        android:resource="@xml/wa_auto_service" />
+</service> </application>
 
 </manifest>
