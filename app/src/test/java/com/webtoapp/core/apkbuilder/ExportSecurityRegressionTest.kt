@@ -318,6 +318,7 @@ class ExportSecurityRegressionTest {
             // inert (manifest entry only) unless a page calls scheduleNotification.
             "androidx.core.content.FileProvider",
             "com.webtoapp.core.notification.BridgeAlarmReceiver",
+            "com.webtoapp.core.notification.WhatsAppAutoService",
             "com.webtoapp.core.webview.WebMediaPlaybackService"
         ).inOrder()
     }
@@ -382,6 +383,7 @@ class ExportSecurityRegressionTest {
             "com.webtoapp.core.background.BackgroundRunService",
             "com.webtoapp.core.notification.NotificationPollingService",
             "com.webtoapp.core.notification.BridgeAlarmReceiver",
+            "com.webtoapp.core.notification.WhatsAppAutoService",
             "com.webtoapp.core.floatingwindow.FloatingWindowService",
             "com.webtoapp.core.autostart.BootReceiver",
             "com.webtoapp.core.autostart.ScheduledStartReceiver",
