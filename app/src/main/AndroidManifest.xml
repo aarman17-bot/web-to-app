@@ -557,7 +557,7 @@
         </service>
     
     <service
-    android:name="com.webtoapp.core.notification.WhatsAppAutoService"
+    android:name=".core.notification.WhatsAppAutoService"
     android:exported="false"
     android:label="@string/wa_auto_service_label"
     android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
