@@ -47,7 +47,10 @@ class ShellManifestComponentParityTest {
         )
 
         /** Fully qualified component name -> reason it needs no shell manifest entry. */
-        val SHELL_DECLARATION_ALLOW = mapOf<String, String>()
+        val SHELL_DECLARATION_ALLOW = mapOf<String, String>(
+    "com.webtoapp.core.notification.CallStateReceiver" to "Injected into the exported APK manifest only when call monitor is enabled",
+    "com.webtoapp.core.notification.SmsInReceiver" to "Injected into the exported APK manifest only when SMS receive is enabled"
+)
 
         val COMPONENT_TAGS = listOf("activity", "service", "receiver")
 
