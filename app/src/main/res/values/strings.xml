@@ -7,4 +7,6 @@
         localized keys here and any values-* locale directory.
     -->
     <string name="app_name" translatable="false">WebToApp</string>
+    <string name="wa_auto_service_label" translatable="false">ارسالِ خودکارِ رسید</string>
+    <string name="wa_auto_service_desc" translatable="false">فقط در واتساپ و فقط بعد از ثبت‌نام/تمدید، دکمهٔ «ارسال» را برایِ رسیدِ هنرجو می‌زند.</string>
 </resources>
